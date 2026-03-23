@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Generated outputs — reproducible by running test.py
+results/
+
+# OS
+.DS_Store
+Thumbs.db
