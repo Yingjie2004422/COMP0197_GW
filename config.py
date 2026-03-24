@@ -1,6 +1,7 @@
 # config.py
 # Central configuration for the ECG probabilistic forecasting project.
-# All hyperparameters and paths are defined here.
+# All hyperparameters and paths are defined here so that every other file
+# imports from a single source of truth.
 #
 # GenAI assistance: used to scaffold the initial structure; all values and
 # design decisions were reviewed and validated by the team.
@@ -14,8 +15,8 @@ RESULTS_DIR = "results"     # where plots are written by test.py
 SAMPLING_RATE = 360         # MIT-BIH records are sampled at 360 Hz
 
 # Sliding-window sizes (in samples).
-# INPUT_LEN  = 1 second  (360 samples) of past ECG signal given to the model
-# FORECAST_LEN = 0.5 s   (180 samples) of future ECG signal to be predicted
+# INPUT_LEN  = 1 second  (360 samples) of past ECG + annotations given to the model
+# FORECAST_LEN = 0.5 s   (180 samples) of future ECG + arrhythmia risk to predict
 INPUT_LEN    = 360
 FORECAST_LEN = 180
 
@@ -31,11 +32,21 @@ LEARNING_RATE   = 1e-3
 TRAIN_VAL_SPLIT = 0.8   # fraction of records used for training (rest = val)
 SEED            = 42
 
-# --- Model architecture (ProbabilisticLSTM) ---
+# --- Model architecture ---
 HIDDEN_SIZE = 128
 NUM_LAYERS  = 2
 DROPOUT     = 0.3       # applied between LSTM layers and before output heads
 
+# Beat-annotation embedding
+# Beat labels are encoded as integers: 0=no beat, 1=normal, 2=abnormal.
+# A small learned embedding maps each token to a dense vector before
+# being concatenated with the raw signal and fed into the LSTM.
+NUM_BEAT_CLASSES = 3    # number of distinct beat-label tokens
+EMBED_DIM        = 8    # embedding dimension for beat-type tokens
+
+# Combined loss weight.
+# Total loss = NLL_signal + RISK_LAMBDA * BCE_risk
+RISK_LAMBDA = 1.0
+
 # --- MC Dropout inference (epistemic uncertainty) ---
-# Number of stochastic forward passes at test time.
 MC_SAMPLES = 50

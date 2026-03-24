@@ -1,20 +1,21 @@
 # train.py
-# Full training pipeline for the probabilistic ECG forecaster.
+# Full training pipeline for the annotation-aware probabilistic ECG forecaster.
 #
 # Run:  python train.py
 #
 # What this script does
 # ---------------------
-# 1. Loads all MIT-BIH records from DATA_FOLDER and creates sliding-window
-#    train / validation DataLoaders (record-level split, no temporal leakage).
-# 2. Instantiates ProbabilisticLSTM and trains it with the Gaussian NLL loss.
-# 3. Applies gradient clipping and a ReduceLROnPlateau learning-rate schedule.
-# 4. Saves the best checkpoint (lowest validation NLL) to MODEL_DIR.
-# 5. Writes a loss-curve plot to RESULTS_DIR.
+# 1. Loads all MIT-BIH records (signal + beat annotations) and creates
+#    sliding-window train / validation DataLoaders (record-level split).
+# 2. Instantiates ProbabilisticLSTM and trains it with a combined loss:
+#      L = NLL_signal  +  RISK_LAMBDA * BCE_arrhythmia_risk
+# 3. Applies gradient clipping and ReduceLROnPlateau scheduling.
+# 4. Saves the best checkpoint (lowest total validation loss) to MODEL_DIR.
+# 5. Writes a dual loss-curve plot to RESULTS_DIR.
 #
-# GenAI assistance: used to draft the training loop boilerplate; gradient
-# clipping, LR scheduling, and checkpoint logic were reviewed and adjusted
-# by the team for correctness.
+# GenAI assistance: used to draft the training-loop boilerplate; the dual-loss
+# formulation, gradient clipping, and checkpoint logic were reviewed and
+# adjusted by the team.
 
 import os
 import numpy as np
@@ -30,32 +31,48 @@ from config import (
     DATA_FOLDER, INPUT_LEN, FORECAST_LEN, STRIDE,
     BATCH_SIZE, NUM_EPOCHS, LEARNING_RATE,
     HIDDEN_SIZE, NUM_LAYERS, DROPOUT,
+    EMBED_DIM, NUM_BEAT_CLASSES, RISK_LAMBDA,
     TRAIN_VAL_SPLIT, SEED, MODEL_DIR, RESULTS_DIR,
 )
 from dataset import get_dataloaders
-from model import ProbabilisticLSTM, gaussian_nll_loss
+from model import ProbabilisticLSTM, combined_loss
 
 
 # ---------------------------------------------------------------------------
 # Training helpers
 # ---------------------------------------------------------------------------
 
-def run_epoch(model, loader, optimizer, device, training: bool) -> float:
-    """Run one full pass over *loader*.  If *training* is True, also
-    back-propagates and updates weights.  Returns mean NLL for the epoch."""
+def run_epoch(
+    model:       ProbabilisticLSTM,
+    loader,
+    optimizer,
+    device:      torch.device,
+    pw_tensor:   torch.Tensor,      # pos_weight for BCE on this device
+    training:    bool,
+) -> tuple[float, float, float]:
+    """One full pass over *loader*.
+
+    Returns (mean_total_loss, mean_nll, mean_risk_bce) for the epoch.
+    """
     model.train() if training else model.eval()
-    total_loss = 0.0
+    total_loss = total_nll = total_risk = 0.0
 
     ctx = torch.enable_grad() if training else torch.no_grad()
     with ctx:
-        for x, y in loader:
-            x, y = x.to(device), y.to(device)
+        for x_sig, x_ann, y_sig, y_risk in loader:
+            x_sig  = x_sig.to(device)
+            x_ann  = x_ann.to(device)
+            y_sig  = y_sig.to(device)
+            y_risk = y_risk.to(device)
 
             if training:
                 optimizer.zero_grad()
 
-            output = model(x)                        # (batch, forecast_len, 2)
-            loss   = gaussian_nll_loss(output, y)
+            sig_out, risk_logit = model(x_sig, x_ann)
+
+            loss, nll_val, risk_val = combined_loss(
+                sig_out, risk_logit, y_sig, y_risk, pw_tensor, RISK_LAMBDA
+            )
 
             if training:
                 loss.backward()
@@ -64,8 +81,11 @@ def run_epoch(model, loader, optimizer, device, training: bool) -> float:
                 optimizer.step()
 
             total_loss += loss.item()
+            total_nll  += nll_val
+            total_risk += risk_val
 
-    return total_loss / len(loader)
+    n = len(loader)
+    return total_loss / n, total_nll / n, total_risk / n
 
 
 # ---------------------------------------------------------------------------
@@ -73,7 +93,6 @@ def run_epoch(model, loader, optimizer, device, training: bool) -> float:
 # ---------------------------------------------------------------------------
 
 def train() -> None:
-    # Reproducibility
     torch.manual_seed(SEED)
     np.random.seed(SEED)
 
@@ -81,7 +100,7 @@ def train() -> None:
     print(f"[train] Device: {device}")
 
     # --- Data ---
-    train_loader, val_loader = get_dataloaders(
+    train_loader, val_loader, pos_weight = get_dataloaders(
         data_folder=DATA_FOLDER,
         input_len=INPUT_LEN,
         forecast_len=FORECAST_LEN,
@@ -90,14 +109,18 @@ def train() -> None:
         split=TRAIN_VAL_SPLIT,
         seed=SEED,
     )
+    # pos_weight as a device tensor for BCEWithLogitsLoss
+    pw_tensor = torch.tensor(pos_weight, dtype=torch.float32, device=device)
 
     # --- Model ---
     model = ProbabilisticLSTM(
-        input_size=1,
-        hidden_size=HIDDEN_SIZE,
-        num_layers=NUM_LAYERS,
-        forecast_len=FORECAST_LEN,
-        dropout=DROPOUT,
+        input_size      = 1,
+        hidden_size     = HIDDEN_SIZE,
+        num_layers      = NUM_LAYERS,
+        forecast_len    = FORECAST_LEN,
+        dropout         = DROPOUT,
+        embed_dim       = EMBED_DIM,
+        num_beat_classes= NUM_BEAT_CLASSES,
     ).to(device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -105,72 +128,92 @@ def train() -> None:
 
     # --- Optimiser and scheduler ---
     optimizer = Adam(model.parameters(), lr=LEARNING_RATE)
-    scheduler = ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.5, patience=4
-    )
+    scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=4)
 
-    # --- Checkpoint / results directories ---
+    # --- Output directories ---
     os.makedirs(MODEL_DIR,   exist_ok=True)
     os.makedirs(RESULTS_DIR, exist_ok=True)
     ckpt_path = os.path.join(MODEL_DIR, "best_model.pt")
 
     best_val_loss = float("inf")
-    train_losses, val_losses = [], []
+    history = {"train_total": [], "val_total": [],
+               "train_nll": [],   "val_nll": [],
+               "train_risk": [],  "val_risk": []}
 
     print(f"\n[train] Starting training for {NUM_EPOCHS} epochs\n")
 
     for epoch in range(1, NUM_EPOCHS + 1):
-        train_loss = run_epoch(model, train_loader, optimizer, device, training=True)
-        val_loss   = run_epoch(model, val_loader,   optimizer, device, training=False)
+        tr_total, tr_nll, tr_risk = run_epoch(
+            model, train_loader, optimizer, device, pw_tensor, training=True)
+        va_total, va_nll, va_risk = run_epoch(
+            model, val_loader,   optimizer, device, pw_tensor, training=False)
 
-        train_losses.append(train_loss)
-        val_losses.append(val_loss)
-        scheduler.step(val_loss)
+        for k, v in zip(
+            ["train_total","val_total","train_nll","val_nll","train_risk","val_risk"],
+            [tr_total, va_total, tr_nll, va_nll, tr_risk, va_risk],
+        ):
+            history[k].append(v)
+
+        scheduler.step(va_total)
 
         flag = ""
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        if va_total < best_val_loss:
+            best_val_loss = va_total
             torch.save(
                 {
                     "epoch": epoch,
                     "model_state_dict": model.state_dict(),
                     "optimizer_state_dict": optimizer.state_dict(),
                     "val_loss": best_val_loss,
-                    # Store architecture config so test.py can rebuild the model
+                    "pos_weight": pos_weight,
+                    # Full architecture config so test.py can rebuild the model
                     "config": {
-                        "input_size":  1,
-                        "hidden_size": HIDDEN_SIZE,
-                        "num_layers":  NUM_LAYERS,
-                        "forecast_len": FORECAST_LEN,
-                        "dropout":     DROPOUT,
+                        "input_size":       1,
+                        "hidden_size":      HIDDEN_SIZE,
+                        "num_layers":       NUM_LAYERS,
+                        "forecast_len":     FORECAST_LEN,
+                        "dropout":          DROPOUT,
+                        "embed_dim":        EMBED_DIM,
+                        "num_beat_classes": NUM_BEAT_CLASSES,
                     },
                 },
                 ckpt_path,
             )
-            flag = "  ← best"
+            flag = "  << best"
 
         print(
-            f"Epoch [{epoch:3d}/{NUM_EPOCHS}] "
-            f"Train NLL: {train_loss:.4f}  "
-            f"Val NLL: {val_loss:.4f}{flag}"
+            f"Epoch [{epoch:3d}/{NUM_EPOCHS}]  "
+            f"Total: {tr_total:.4f}/{va_total:.4f}  "
+            f"NLL: {tr_nll:.4f}/{va_nll:.4f}  "
+            f"Risk BCE: {tr_risk:.4f}/{va_risk:.4f}"
+            f"{flag}"
         )
 
-    # --- Loss curve ---
-    fig, ax = plt.subplots(figsize=(9, 4))
-    ax.plot(train_losses, label="Train NLL")
-    ax.plot(val_losses,   label="Val NLL")
-    ax.set_xlabel("Epoch")
-    ax.set_ylabel("Negative Log-Likelihood")
-    ax.set_title("Training Progress")
-    ax.legend()
+    # --- Dual loss curves ---
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    epochs = range(1, NUM_EPOCHS + 1)
+
+    for ax, train_key, val_key, title in zip(
+        axes,
+        ["train_total", "train_nll",  "train_risk"],
+        ["val_total",   "val_nll",    "val_risk"],
+        ["Total Loss",  "Signal NLL", "Risk BCE"],
+    ):
+        ax.plot(epochs, history[train_key], label="Train")
+        ax.plot(epochs, history[val_key],   label="Val")
+        ax.set_title(title)
+        ax.set_xlabel("Epoch")
+        ax.legend()
+
+    plt.suptitle("Training Progress", fontsize=13)
     plt.tight_layout()
     fig_path = os.path.join(RESULTS_DIR, "loss_curves.png")
     plt.savefig(fig_path, dpi=150)
     plt.close()
 
-    print(f"\n[train] Done.  Best val NLL: {best_val_loss:.4f}")
-    print(f"[train] Checkpoint saved to : {ckpt_path}")
-    print(f"[train] Loss curve saved to : {fig_path}")
+    print(f"\n[train] Done.  Best val total loss: {best_val_loss:.4f}")
+    print(f"[train] Checkpoint : {ckpt_path}")
+    print(f"[train] Loss curves: {fig_path}")
 
 
 if __name__ == "__main__":
