@@ -96,7 +96,7 @@ def train() -> None:
     torch.manual_seed(SEED)
     np.random.seed(SEED)
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.accelerator.current_accelerator() if torch.accelerator.is_available() else "cpu"
     print(f"[train] Device: {device}")
 
     # --- Data ---
