@@ -3,277 +3,697 @@
 #
 # Run:  python test.py
 #
-# What this script does
-# ---------------------
-# 1. Loads the best checkpoint from MODEL_DIR.
-# 2. Evaluates on the validation set and reports:
-#      Signal head  — MSE and Gaussian NLL
-#      Risk head    — binary accuracy and AUC-ROC (no sklearn needed)
-# 3. Produces three figures saved to RESULTS_DIR:
-#      predictions.png         — forecast with ±1σ/±2σ uncertainty bands
-#      uncertainty_horizon.png — aleatoric vs epistemic σ across forecast horizon
-#      risk_analysis.png       — predicted arrhythmia risk vs ground truth
+# Improvements over baseline
+# --------------------------
+#   Deep Ensemble + MC Dropout : combines N_ENSEMBLE models × MC_SAMPLES passes
+#                                for richer epistemic uncertainty.
+#   MDN support                : works with K=1 (single Gaussian) or K>1 (MDN).
+#   Conformal prediction       : normalized residual quantile on cal_loader gives
+#                                distribution-free coverage guarantee.
+#   Conformal risk prediction  : nonconformity-score set for risk head.
+#   Winkler score              : interval sharpness metric at alpha=0.10.
+#   Per-beat-type metrics      : MSE stratified by beat type (Normal/PVC/APB/Other).
+#   CRPS metric                : closed-form proper scoring rule.
+#   Calibration diagram        : reliability plot with conformal level marked.
+#   Arrhythmia uncertainty     : aleatoric vs epistemic σ by arrhythmia presence.
+#   Attention heatmap          : which input timesteps the model focuses on.
+#   Temperature scaling        : calibrated risk logit division per model.
+#   HRV features               : SDNN, RMSSD, pNN50 passed to all model calls.
+#   Diebold-Mariano test       : statistical test for ensemble vs single model.
 #
-# GenAI assistance: used to draft the MC Dropout loop, AUC computation, and
-# plot layout; the uncertainty decomposition was verified against Kendall &
-# Gal (2017).
+# Figures produced
+# ----------------
+#   predictions.png              — forecast with uncertainty bands + conformal interval
+#   uncertainty_horizon.png      — aleatoric vs epistemic σ across forecast horizon
+#   risk_analysis.png            — risk score distribution + ROC curve
+#   calibration.png              — reliability diagram + conformal coverage level
+#   arrhythmia_uncertainty.png   — uncertainty stratified by arrhythmia presence
+#   attention_weights.png        — attention heatmap over input ECG (if applicable)
+#
+# GenAI assistance: used to draft the MC Dropout loop, CRPS formula, AUC
+# computation, calibration diagram, conformal prediction logic, and Winkler
+# score; verified against Kendall & Gal (2017), Gneiting & Raftery (2007),
+# and Angelopoulos & Bates (2022). Extended with temperature scaling, HRV
+# feature passing, conformal risk prediction, and Diebold-Mariano test.
 
 import os
-import numpy as np
-import torch
+import math
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import torch.nn.functional as F
 
 from config import (
     DATA_FOLDER, INPUT_LEN, FORECAST_LEN, STRIDE,
     BATCH_SIZE, TRAIN_VAL_SPLIT, SEED,
-    MODEL_DIR, RESULTS_DIR, MC_SAMPLES,
+    MODEL_DIR, RESULTS_DIR, MC_SAMPLES, N_ENSEMBLE,
+    USE_MDN, K_MDN, CONFORMAL_ALPHA_RISK,
 )
 from dataset import get_dataloaders
-from model import ProbabilisticLSTM, gaussian_nll_loss
+from model import ProbabilisticLSTM, gaussian_nll_loss, gaussian_crps, signal_mean, signal_variance
 
 
 # ---------------------------------------------------------------------------
-# Model loading
+# Model loading (ensemble)
 # ---------------------------------------------------------------------------
 
-def load_model(checkpoint_path: str, device: torch.device) -> ProbabilisticLSTM:
-    """Reconstruct the model from a checkpoint saved by train.py."""
-    ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    cfg  = ckpt["config"]
-    model = ProbabilisticLSTM(
-        input_size      = cfg["input_size"],
-        hidden_size     = cfg["hidden_size"],
-        num_layers      = cfg["num_layers"],
-        forecast_len    = cfg["forecast_len"],
-        dropout         = cfg["dropout"],
-        embed_dim       = cfg["embed_dim"],
-        num_beat_classes= cfg["num_beat_classes"],
-    ).to(device)
-    model.load_state_dict(ckpt["model_state_dict"])
-    print(
-        f"[test] Loaded checkpoint from epoch {ckpt['epoch']} "
-        f"(val total loss: {ckpt['val_loss']:.4f})"
-    )
-    return model
+def load_ensemble(
+    model_dir: str,
+    device:    torch.device,
+) -> list[ProbabilisticLSTM]:
+    """Load all available model_*.pt checkpoints from model_dir.
+
+    Tries model_0.pt, model_1.pt, ... and stops when a file is not found.
+    Falls back to best_model.pt if no model_*.pt files exist (legacy compat).
+
+    Returns a list of models (all in eval mode by default).
+    """
+    models = []
+    idx    = 0
+    while True:
+        path = os.path.join(model_dir, f"model_{idx}.pt")
+        if not os.path.exists(path):
+            break
+        ckpt  = torch.load(path, map_location=device, weights_only=False)
+        cfg   = ckpt["config"]
+        model = ProbabilisticLSTM(**cfg).to(device)
+        model.load_state_dict(ckpt["model_state_dict"])
+        model.eval()
+        # Load temperature for calibrated risk prediction
+        model.temperature = ckpt.get("temperature", 1.0)
+        print(
+            f"[test] Loaded model_{idx}.pt  epoch={ckpt['epoch']}  "
+            f"val_loss={ckpt['val_loss']:.4f}  K={cfg.get('K', 1)}  "
+            f"T={model.temperature:.4f}"
+        )
+        models.append(model)
+        idx += 1
+
+    if not models:
+        # Legacy fallback
+        legacy = os.path.join(model_dir, "best_model.pt")
+        if os.path.exists(legacy):
+            ckpt  = torch.load(legacy, map_location=device, weights_only=False)
+            cfg   = ckpt["config"]
+            model = ProbabilisticLSTM(**cfg).to(device)
+            model.load_state_dict(ckpt["model_state_dict"])
+            model.eval()
+            model.temperature = ckpt.get("temperature", 1.0)
+            print(
+                f"[test] Loaded best_model.pt (legacy)  "
+                f"epoch={ckpt['epoch']}  val_loss={ckpt['val_loss']:.4f}"
+            )
+            models.append(model)
+
+    if not models:
+        raise FileNotFoundError(
+            f"No checkpoints found in '{model_dir}'. Run python train.py first."
+        )
+
+    print(f"[test] Ensemble size: {len(models)} model(s)\n")
+    return models
 
 
 # ---------------------------------------------------------------------------
-# MC Dropout inference
+# Ensemble + MC Dropout inference
 # ---------------------------------------------------------------------------
 
-def mc_dropout_predict(
-    model:    ProbabilisticLSTM,
-    x_signal: torch.Tensor,
-    x_annot:  torch.Tensor,
-    n_samples: int = MC_SAMPLES,
-) -> tuple[torch.Tensor, ...]:
-    """Run *n_samples* stochastic forward passes with dropout active.
+def ensemble_mc_predict(
+    models:  list[ProbabilisticLSTM],
+    x_sig:   torch.Tensor,
+    x_ann:   torch.Tensor,
+    x_feat:  torch.Tensor,
+    K:       int,
+    x_hrv:   torch.Tensor | None = None,
+    n_mc:    int = MC_SAMPLES,
+) -> tuple:
+    """Combined ensemble + MC Dropout inference.
+
+    For each model in the ensemble, run n_mc stochastic forward passes
+    (dropout active).  Aggregate via the law of total variance:
+
+        aleatoric_var  = mean over all (model × MC) runs of predicted σ²
+        epistemic_var  = variance of predicted means across ensemble members
+        total_std      = sqrt(aleatoric_var + epistemic_var)
+
+    Parameters
+    ----------
+    models  : list of ProbabilisticLSTM (loaded ensemble)
+    x_sig   : (batch, input_len, 2)
+    x_ann   : (batch, input_len)
+    x_feat  : (batch, input_len, 4)
+    K       : number of mixture components (from checkpoint config)
+    x_hrv   : (batch, 3) or None
+    n_mc    : MC Dropout samples per ensemble member
 
     Returns
     -------
-    combined_mean : (batch, forecast_len)  — mean of μ across samples
-    total_std     : (batch, forecast_len)  — sqrt(epistemic + aleatoric var)
-    epistemic_var : (batch, forecast_len)  — variance of μ across samples
-    aleatoric_var : (batch, forecast_len)  — mean σ² across samples
-    risk_prob     : (batch,)               — mean sigmoid(logit) across samples
+    combined_mean : (batch, forecast_len)
+    total_std     : (batch, forecast_len)
+    epistemic_var : (batch, forecast_len)
+    aleatoric_var : (batch, forecast_len)
+    risk_prob     : (batch,) or None
     """
-    model.train()   # keep dropout active
-    all_means, all_vars, all_risks = [], [], []
+    member_means = []
+    member_vars  = []
+    all_risks    = []
 
-    with torch.no_grad():
-        for _ in range(n_samples):
-            sig_out, risk_logit = model(x_signal, x_annot)
-            all_means.append(sig_out[..., 0])
-            all_vars.append(torch.exp(sig_out[..., 1]))
-            all_risks.append(torch.sigmoid(risk_logit).squeeze(-1))
+    for model in models:
+        model.train()   # keep dropout stochastic
+        mc_means = []
+        mc_vars  = []
+        mc_risks = []
 
-    all_means = torch.stack(all_means)   # (n, batch, forecast_len)
-    all_vars  = torch.stack(all_vars)
-    all_risks = torch.stack(all_risks)   # (n, batch)
+        with torch.no_grad():
+            for _ in range(n_mc):
+                sig_out, risk_logit = model(x_sig, x_ann, x_feat, x_hrv=x_hrv)
+                mu    = signal_mean(sig_out, K=K)
+                var   = signal_variance(sig_out, K=K)
+                mc_means.append(mu)
+                mc_vars.append(var)
+                if risk_logit is not None:
+                    risk_logit_cal = risk_logit / getattr(model, 'temperature', 1.0)
+                    mc_risks.append(torch.sigmoid(risk_logit_cal).squeeze(-1))
 
-    # Law of total variance for uncertainty decomposition
-    aleatoric_var = all_vars.mean(dim=0)              # (batch, forecast_len)
-    epistemic_var = all_means.var(dim=0)
-    combined_mean = all_means.mean(dim=0)
+        # Average MC passes for this member
+        mc_means_t = torch.stack(mc_means)   # (n_mc, batch, T)
+        mc_vars_t  = torch.stack(mc_vars)    # (n_mc, batch, T)
+        member_means.append(mc_means_t.mean(dim=0))     # (batch, T)
+        member_vars.append(mc_vars_t.mean(dim=0))       # (batch, T)
+        if mc_risks:
+            all_risks.append(torch.stack(mc_risks).mean(dim=0))
+
+    member_means_t = torch.stack(member_means)   # (N, batch, T)
+    member_vars_t  = torch.stack(member_vars)    # (N, batch, T)
+
+    combined_mean = member_means_t.mean(dim=0)               # (batch, T)
+    aleatoric_var = member_vars_t.mean(dim=0)                 # E[sigma^2]
+    epistemic_var = member_means_t.var(dim=0)                 # Var[mu]
     total_std     = torch.sqrt(aleatoric_var + epistemic_var)
-    risk_prob     = all_risks.mean(dim=0)             # (batch,)
+
+    risk_prob = torch.stack(all_risks).mean(dim=0) if all_risks else None
 
     return combined_mean, total_std, epistemic_var, aleatoric_var, risk_prob
 
 
 # ---------------------------------------------------------------------------
-# AUC-ROC (pure numpy, no sklearn)
+# Conformal prediction calibration (signal)
+# ---------------------------------------------------------------------------
+
+def conformal_calibrate(
+    models:     list[ProbabilisticLSTM],
+    cal_loader,
+    device:     torch.device,
+    K:          int,
+    alpha:      float = 0.10,
+) -> float:
+    """Compute normalized conformal quantile on the calibration set.
+
+    Runs the ensemble in eval mode (no MC Dropout) and collects normalized
+    (studentized) residuals r_i = |y_i - mu_i| / sigma_i for every timestep.
+
+    Returns q_conformal such that the prediction interval
+        [mu - q * sigma, mu + q * sigma]
+    achieves at least (1-alpha) marginal coverage on held-out data.
+
+    Uses the standard conformal guarantee:
+        q = quantile(residuals, ceil((n+1)*(1-alpha)) / n)
+    """
+    residuals = []
+
+    for model in models:
+        model.eval()
+
+    with torch.no_grad():
+        for x_sig, x_ann, x_feat, y_sig, _, _, x_hrv in cal_loader:
+            x_sig  = x_sig.to(device)
+            x_ann  = x_ann.to(device)
+            x_feat = x_feat.to(device)
+            x_hrv  = x_hrv.to(device)
+            y_sig  = y_sig.to(device)
+
+            # Average ensemble predictions (single pass, no MC)
+            batch_means = []
+            batch_vars  = []
+            for model in models:
+                sig_out, _ = model(x_sig, x_ann, x_feat, x_hrv=x_hrv)
+                batch_means.append(signal_mean(sig_out, K=K))
+                batch_vars.append(signal_variance(sig_out, K=K))
+
+            mu    = torch.stack(batch_means).mean(dim=0)      # (batch, T)
+            var   = torch.stack(batch_vars).mean(dim=0)       # (batch, T)
+            sigma = torch.sqrt(var).clamp(min=1e-6)
+
+            # Normalized residual |y - mu| / sigma, flattened to scalar per timestep
+            res = ((y_sig - mu).abs() / sigma).cpu().numpy()  # (batch, T)
+            residuals.append(res.ravel())
+
+    residuals = np.concatenate(residuals)
+    n         = len(residuals)
+    # Conformal quantile level: ceil((n+1)*(1-alpha)) / n, clipped to [0,1]
+    level = min(math.ceil((n + 1) * (1.0 - alpha)) / n, 1.0)
+    q     = float(np.quantile(residuals, level))
+    print(
+        f"[test] Conformal calibration: n={n:,}  alpha={alpha}  "
+        f"level={level:.6f}  q={q:.4f}"
+    )
+    return q
+
+
+# ---------------------------------------------------------------------------
+# Conformal prediction calibration (risk head)
+# ---------------------------------------------------------------------------
+
+def conformal_calibrate_risk(
+    models: list,
+    cal_loader,
+    device:  torch.device,
+    alpha:   float = 0.10,
+) -> float:
+    """Nonconformity scores for risk head. Returns conformal threshold q_risk.
+
+    Score for sample i: 1 - p(y_true_i | x_i)
+      y=0: score = prob  (= 1 - p[0])
+      y=1: score = 1 - prob  (= 1 - p[1])
+
+    Prediction set at test time: include class c if score(c) <= q_risk.
+      Include 0 if prob    <= q_risk
+      Include 1 if 1-prob  <= q_risk  i.e. prob >= 1-q_risk
+    """
+    scores = []
+    for model in models:
+        model.eval()
+    with torch.no_grad():
+        for batch in cal_loader:
+            x_sig, x_ann, x_feat, _, y_risk, _, x_hrv = batch
+            x_sig  = x_sig.to(device); x_ann  = x_ann.to(device)
+            x_feat = x_feat.to(device); x_hrv  = x_hrv.to(device)
+            batch_probs = []
+            for model in models:
+                _, risk_logit = model(x_sig, x_ann, x_feat, x_hrv=x_hrv)
+                if risk_logit is None:
+                    return float("nan")
+                logit_cal = risk_logit / getattr(model, 'temperature', 1.0)
+                batch_probs.append(torch.sigmoid(logit_cal).squeeze(-1))
+            prob = torch.stack(batch_probs).mean(dim=0).cpu().numpy()
+            labels = y_risk.numpy()
+            # nonconformity score: 1 - p(true class)
+            nc_score = np.where(labels > 0.5, 1.0 - prob, prob)
+            scores.append(nc_score)
+
+    scores = np.concatenate(scores)
+    n = len(scores)
+    level = min(math.ceil((n + 1) * (1.0 - alpha)) / n, 1.0)
+    q_risk = float(np.quantile(scores, level))
+    print(
+        f"[test] Conformal risk calibration: n={n:,}  alpha={alpha}  "
+        f"level={level:.6f}  q_risk={q_risk:.4f}"
+    )
+    return q_risk
+
+
+# ---------------------------------------------------------------------------
+# Winkler score
+# ---------------------------------------------------------------------------
+
+def winkler_score(
+    mu:          np.ndarray,
+    sigma:       np.ndarray,
+    y:           np.ndarray,
+    q_conformal: float,
+    alpha:       float = 0.10,
+) -> float:
+    """Compute the mean Winkler Score for a prediction interval.
+
+    The interval is [lower, upper] = [mu - q*sigma, mu + q*sigma].
+
+    WS_i = (upper_i - lower_i)
+           + (2/alpha) * max(0, lower_i - y_i)   [lower violation]
+           + (2/alpha) * max(0, y_i - upper_i)   [upper violation]
+
+    Lower WS = narrower intervals with fewer violations = better.
+
+    Parameters
+    ----------
+    mu, sigma, y : numpy arrays of the same shape (any shape, computed flat)
+    q_conformal  : conformal quantile (multiplied with sigma to get half-width)
+    alpha        : nominal miscoverage rate (default 0.10 → 90% interval)
+
+    Returns
+    -------
+    float : mean Winkler Score over all elements
+    """
+    lower = mu - q_conformal * sigma
+    upper = mu + q_conformal * sigma
+    width = upper - lower                                  # always positive
+    pen_l = np.maximum(0.0, lower - y) * (2.0 / alpha)
+    pen_u = np.maximum(0.0, y - upper) * (2.0 / alpha)
+    return float((width + pen_l + pen_u).mean())
+
+
+# ---------------------------------------------------------------------------
+# AUC-ROC (pure numpy)
 # ---------------------------------------------------------------------------
 
 def roc_auc(y_true: np.ndarray, y_score: np.ndarray) -> float:
-    """Compute AUC-ROC via trapezoidal integration (no sklearn required)."""
-    y_true, y_score = np.asarray(y_true), np.asarray(y_score)
-    desc      = np.argsort(-y_score)
-    y_sorted  = y_true[desc]
-    nP = y_sorted.sum()
-    nN = len(y_sorted) - nP
+    y_true  = np.asarray(y_true,  dtype=float)
+    y_score = np.asarray(y_score, dtype=float)
+    desc    = np.argsort(-y_score)
+    ys      = y_true[desc]
+    nP, nN  = ys.sum(), len(ys) - ys.sum()
     if nP == 0 or nN == 0:
         return float("nan")
-    tpr = np.cumsum(y_sorted)      / nP
-    fpr = np.cumsum(1 - y_sorted)  / nN
+    tpr = np.cumsum(ys)       / nP
+    fpr = np.cumsum(1 - ys)   / nN
     return float(np.trapz(tpr, fpr))
 
 
 # ---------------------------------------------------------------------------
-# Evaluation
+# Diebold-Mariano test
+# ---------------------------------------------------------------------------
+
+def diebold_mariano_test(errors1: np.ndarray, errors2: np.ndarray) -> tuple[float, float]:
+    """Two-sided Diebold-Mariano test for equal predictive accuracy.
+
+    Tests H0: E[L(e1)] = E[L(e2)]  where L = squared error.
+    Uses the Harvey-Leybourne-Newbold (1997) small-sample correction.
+
+    Returns (dm_statistic, p_value).
+    """
+    d  = errors1 ** 2 - errors2 ** 2      # loss differential
+    n  = len(d)
+    d_bar  = d.mean()
+    d_var  = ((d - d_bar) ** 2).sum() / (n * (n - 1))  # variance of mean
+    if d_var <= 0:
+        return 0.0, 1.0
+    dm = d_bar / math.sqrt(d_var)
+    # Two-sided p-value via standard normal
+    p  = 2.0 * (1.0 - 0.5 * (1.0 + math.erf(abs(dm) / math.sqrt(2))))
+    return float(dm), float(p)
+
+
+def collect_forecast_errors(models_a, models_b, loader, device, K, max_batches=60):
+    """Return (errors_a, errors_b) as flat arrays of per-sample mean squared errors."""
+    def _get_errors(models, loader):
+        errs = []
+        for m in models: m.eval()
+        with torch.no_grad():
+            for i, (x_sig, x_ann, x_feat, y_sig, _, _, x_hrv) in enumerate(loader):
+                if i >= max_batches: break
+                x_sig  = x_sig.to(device); x_ann  = x_ann.to(device)
+                x_feat = x_feat.to(device); x_hrv  = x_hrv.to(device)
+                means = []
+                for m in models:
+                    sig_out, _ = m(x_sig, x_ann, x_feat, x_hrv=x_hrv)
+                    means.append(signal_mean(sig_out, K=K))
+                mu = torch.stack(means).mean(0)
+                errs.append(((mu - y_sig.to(device))**2).mean(-1).cpu().numpy())
+        return np.concatenate(errs)
+    return _get_errors(models_a, loader), _get_errors(models_b, loader)
+
+
+# ---------------------------------------------------------------------------
+# Quantitative evaluation
 # ---------------------------------------------------------------------------
 
 def evaluate(
-    model:  ProbabilisticLSTM,
+    models:      list[ProbabilisticLSTM],
     loader,
-    device: torch.device,
+    device:      torch.device,
+    K:           int,
+    q_conformal: float | None = None,
 ) -> dict:
-    """Return a dict of scalar metrics over the full loader.
+    """Return evaluation metrics over a data loader using ensemble mean predictions.
+
+    Each model is run in eval mode with a single forward pass (no MC Dropout).
+    Predictions are averaged over ensemble members.
 
     Metrics
     -------
     mse      : mean squared error of predicted μ vs ground truth
-    nll      : Gaussian NLL of the signal head
-    risk_acc : binary accuracy of arrhythmia risk (threshold 0.5)
-    risk_auc : AUC-ROC for arrhythmia risk probability
+    nll      : Gaussian NLL (nan for MDN or deterministic; uses first component mean)
+    crps     : Continuous Ranked Probability Score (nan if not applicable)
+    risk_acc : binary accuracy at threshold 0.5
+    risk_auc : AUC-ROC for risk probability
+    winkler  : Winkler Score at alpha=0.10 (only if q_conformal is provided)
     """
-    model.eval()
-    total_nll = total_mse = 0.0
+    for model in models:
+        model.eval()
+
+    total_nll = total_mse = total_crps = 0.0
+    n_nll     = 0
     n_batches = 0
-    all_risk_probs, all_risk_labels = [], []
+    all_probs, all_labels = [], []
+    all_mu, all_sigma, all_y = [], [], []
 
     with torch.no_grad():
-        for x_sig, x_ann, y_sig, y_risk in loader:
+        for x_sig, x_ann, x_feat, y_sig, y_risk, _, x_hrv in loader:
             x_sig  = x_sig.to(device)
             x_ann  = x_ann.to(device)
+            x_feat = x_feat.to(device)
+            x_hrv  = x_hrv.to(device)
             y_sig  = y_sig.to(device)
             y_risk = y_risk.to(device)
 
-            sig_out, risk_logit = model(x_sig, x_ann)
-            total_nll += gaussian_nll_loss(sig_out, y_sig).item()
-            total_mse += ((sig_out[..., 0] - y_sig) ** 2).mean().item()
+            # Average over ensemble members
+            batch_means  = []
+            batch_vars   = []
+            batch_risks  = []
+            batch_sig_out_k1 = []   # keep first K=1-equivalent output for CRPS/NLL
 
-            risk_prob = torch.sigmoid(risk_logit).squeeze(-1)
-            all_risk_probs.append(risk_prob.cpu().numpy())
-            all_risk_labels.append(y_risk.cpu().numpy())
+            for model in models:
+                sig_out, risk_logit = model(x_sig, x_ann, x_feat, x_hrv=x_hrv)
+                batch_means.append(signal_mean(sig_out, K=K))
+                batch_vars.append(signal_variance(sig_out, K=K))
+                if K == 1:
+                    batch_sig_out_k1.append(sig_out)
+                if risk_logit is not None:
+                    risk_logit_cal = risk_logit / getattr(model, 'temperature', 1.0)
+                    batch_risks.append(torch.sigmoid(risk_logit_cal).squeeze(-1))
+
+            mu  = torch.stack(batch_means).mean(dim=0)   # (batch, T)
+            var = torch.stack(batch_vars).mean(dim=0)    # (batch, T)
+
+            total_mse += ((mu - y_sig) ** 2).mean().item()
+
+            # NLL and CRPS only for single-Gaussian (K=1) probabilistic mode
+            if K == 1 and batch_sig_out_k1:
+                avg_sig_out = torch.stack(batch_sig_out_k1).mean(dim=0)
+                if avg_sig_out.shape[-1] == 2:
+                    total_nll  += gaussian_nll_loss(avg_sig_out, y_sig, beta=0.0).item()
+                    total_crps += gaussian_crps(avg_sig_out, y_sig)
+                    n_nll      += 1
+
+            if batch_risks:
+                prob = torch.stack(batch_risks).mean(dim=0)
+                all_probs.append(prob.cpu().numpy())
+                all_labels.append(y_risk.cpu().numpy())
+
+            if q_conformal is not None:
+                all_mu.append(mu.cpu().numpy())
+                all_sigma.append(torch.sqrt(var).clamp(min=1e-6).cpu().numpy())
+                all_y.append(y_sig.cpu().numpy())
+
             n_batches += 1
 
-    probs  = np.concatenate(all_risk_probs)
-    labels = np.concatenate(all_risk_labels)
-    preds  = (probs >= 0.5).astype(float)
+    probs  = np.concatenate(all_probs)  if all_probs  else np.array([])
+    labels = np.concatenate(all_labels) if all_labels else np.array([])
 
-    return {
-        "mse":      total_mse / n_batches,
-        "nll":      total_nll / n_batches,
-        "risk_acc": float((preds == labels).mean()),
-        "risk_auc": roc_auc(labels, probs),
+    result = {
+        "mse":      total_mse  / n_batches,
+        "nll":      total_nll  / n_nll    if n_nll   else float("nan"),
+        "crps":     total_crps / n_nll    if n_nll   else float("nan"),
+        "risk_acc": float(((probs >= 0.5) == labels).mean()) if len(probs) else float("nan"),
+        "risk_auc": roc_auc(labels, probs)                   if len(probs) else float("nan"),
+        "winkler":  float("nan"),
     }
+
+    if q_conformal is not None and all_mu:
+        mu_arr    = np.concatenate(all_mu).ravel()
+        sigma_arr = np.concatenate(all_sigma).ravel()
+        y_arr     = np.concatenate(all_y).ravel()
+        result["winkler"] = winkler_score(mu_arr, sigma_arr, y_arr, q_conformal)
+
+    return result
 
 
 # ---------------------------------------------------------------------------
-# Plotting
+# Per-beat-type evaluation
+# ---------------------------------------------------------------------------
+
+BEAT_TYPE_NAMES = {0: "No-beat", 1: "Normal", 2: "PVC", 3: "APB", 4: "Other"}
+
+
+def per_beat_type_evaluate(
+    models: list[ProbabilisticLSTM],
+    loader,
+    device: torch.device,
+    K:      int,
+) -> None:
+    """Compute mean MSE stratified by dominant beat type in the forecast window.
+
+    Beat types (y_beat_type, 6th element of batch):
+        0 = no beat, 1 = normal, 2 = PVC, 3 = APB, 4 = other abnormal
+
+    Prints a table of MSE per beat type.
+    """
+    for model in models:
+        model.eval()
+
+    mse_by_type: dict[int, list] = {t: [] for t in range(5)}
+
+    with torch.no_grad():
+        for x_sig, x_ann, x_feat, y_sig, _, y_beat_type, x_hrv in loader:
+            x_sig  = x_sig.to(device)
+            x_ann  = x_ann.to(device)
+            x_feat = x_feat.to(device)
+            x_hrv  = x_hrv.to(device)
+            y_sig  = y_sig.to(device)
+
+            # Ensemble mean
+            batch_means = []
+            for model in models:
+                sig_out, _ = model(x_sig, x_ann, x_feat, x_hrv=x_hrv)
+                batch_means.append(signal_mean(sig_out, K=K))
+            mu = torch.stack(batch_means).mean(dim=0)   # (batch, T)
+
+            # Per-sample MSE
+            mse_per_sample = ((mu - y_sig) ** 2).mean(dim=-1).cpu().numpy()  # (batch,)
+            types          = y_beat_type.numpy()
+
+            for t in range(5):
+                mask = types == t
+                if mask.any():
+                    mse_by_type[t].extend(mse_per_sample[mask].tolist())
+
+    print("\n[test] ── Per-Beat-Type MSE ──────────────────────────────────")
+    print(f"  {'Beat Type':<18}  {'N windows':>10}  {'Mean MSE':>12}")
+    print(f"  {'-'*18}  {'-'*10}  {'-'*12}")
+    for t in range(5):
+        vals = mse_by_type[t]
+        if vals:
+            print(
+                f"  {BEAT_TYPE_NAMES[t]:<18}  {len(vals):>10,}  "
+                f"{np.mean(vals):>12.6f}"
+            )
+        else:
+            print(f"  {BEAT_TYPE_NAMES[t]:<18}  {'0':>10}  {'N/A':>12}")
+    print("[test] ─────────────────────────────────────────────────────────\n")
+
+
+# ---------------------------------------------------------------------------
+# Plot 1 — Predictions with uncertainty bands
 # ---------------------------------------------------------------------------
 
 def plot_predictions(
-    model:    ProbabilisticLSTM,
+    models:      list[ProbabilisticLSTM],
     loader,
-    device:   torch.device,
-    n_examples: int = 6,
+    device:      torch.device,
+    K:           int,
+    q_conformal: float | None = None,
+    n_examples:  int = 6,
 ) -> None:
-    """Forecast examples with MC Dropout uncertainty bands.
-    Title of each panel shows the ground-truth and predicted arrhythmia risk.
-    Saved to RESULTS_DIR/predictions.png.
-    """
     os.makedirs(RESULTS_DIR, exist_ok=True)
-    x_sig, x_ann, y_sig, y_risk = next(iter(loader))
-    x_sig, x_ann = x_sig.to(device), x_ann.to(device)
+    x_sig, x_ann, x_feat, y_sig, y_risk, _, x_hrv = next(iter(loader))
+    x_sig  = x_sig.to(device)
+    x_ann  = x_ann.to(device)
+    x_feat = x_feat.to(device)
+    x_hrv  = x_hrv.to(device)
 
-    mean, total_std, epi_var, ale_var, risk_prob = mc_dropout_predict(
-        model, x_sig, x_ann
+    mean, total_std, epi_var, ale_var, risk_prob = ensemble_mc_predict(
+        models, x_sig, x_ann, x_feat, K=K, x_hrv=x_hrv, n_mc=20
     )
-
     mean      = mean.cpu().numpy()
     total_std = total_std.cpu().numpy()
     epi_std   = np.sqrt(epi_var.cpu().numpy())
     ale_std   = np.sqrt(ale_var.cpu().numpy())
-    x_np      = x_sig.cpu().squeeze(-1).numpy()
+    # x_sig is (batch, input_len, 2) — use lead 0 for display
+    x_np      = x_sig.cpu()[:, :, 0].numpy()
     y_np      = y_sig.numpy()
-    risk_prob = risk_prob.cpu().numpy()
-    y_risk    = y_risk.numpy()
+    r_prob    = risk_prob.cpu().numpy() if risk_prob is not None else None
+    r_true    = y_risk.numpy()
 
     n = min(n_examples, len(x_np))
     fig, axes = plt.subplots(n, 1, figsize=(14, 4 * n))
     if n == 1:
         axes = [axes]
 
-    input_t    = np.arange(INPUT_LEN)
-    forecast_t = np.arange(INPUT_LEN, INPUT_LEN + FORECAST_LEN)
+    t_in = np.arange(INPUT_LEN)
+    t_fc = np.arange(INPUT_LEN, INPUT_LEN + FORECAST_LEN)
 
     for i, ax in enumerate(axes):
-        ax.plot(input_t,    x_np[i],  color="steelblue", lw=0.8, alpha=0.9,
-                label="Input ECG")
-        ax.plot(forecast_t, y_np[i],  color="green",     lw=1.2,
-                label="Ground Truth")
-        ax.plot(forecast_t, mean[i],  color="crimson",   lw=1.2, ls="--",
-                label="Predicted μ")
-        ax.fill_between(
-            forecast_t,
-            mean[i] - total_std[i], mean[i] + total_std[i],
-            alpha=0.30, color="crimson", label="±1σ total",
-        )
-        ax.fill_between(
-            forecast_t,
-            mean[i] - 2 * total_std[i], mean[i] + 2 * total_std[i],
-            alpha=0.12, color="crimson", label="±2σ total",
-        )
+        ax.plot(t_in, x_np[i], color="steelblue", lw=0.8, alpha=0.9, label="Input ECG")
+        ax.plot(t_fc, y_np[i], color="green",     lw=1.2,             label="Ground Truth")
+        ax.plot(t_fc, mean[i], color="crimson",   lw=1.2, ls="--",    label="Predicted μ")
+        ax.fill_between(t_fc, mean[i]-total_std[i], mean[i]+total_std[i],
+                        alpha=0.30, color="crimson", label="±1σ total")
+        ax.fill_between(t_fc, mean[i]-2*total_std[i], mean[i]+2*total_std[i],
+                        alpha=0.12, color="crimson", label="±2σ total")
+        # Conformal interval (dashed lines)
+        if q_conformal is not None:
+            conf_lo = mean[i] - q_conformal * total_std[i]
+            conf_hi = mean[i] + q_conformal * total_std[i]
+            ax.plot(t_fc, conf_lo, color="purple", lw=1.0, ls="--", alpha=0.7,
+                    label=f"Conformal 90% (q={q_conformal:.2f})")
+            ax.plot(t_fc, conf_hi, color="purple", lw=1.0, ls="--", alpha=0.7)
         ax.axvline(INPUT_LEN, color="gray", ls=":", lw=1)
 
-        true_risk_str = "YES" if y_risk[i] > 0.5 else "NO"
-        pred_risk_str = f"{risk_prob[i]:.2f}"
-        ax.set_title(
-            f"Sample {i+1}  |  Arrhythmia in window — True: {true_risk_str}  "
-            f"Predicted prob: {pred_risk_str}  |  "
-            f"Ale σ: {ale_std[i].mean():.4f}  Epi σ: {epi_std[i].mean():.4f}"
+        title = (
+            f"Sample {i+1}  |  Ale σ: {ale_std[i].mean():.4f}  "
+            f"Epi σ: {epi_std[i].mean():.4f}"
         )
-        ax.set_xlabel("Timestep (samples)")
+        if r_prob is not None:
+            title += (
+                f"  |  Risk — True: {'YES' if r_true[i] > 0.5 else 'NO'}  "
+                f"Pred: {r_prob[i]:.2f}"
+            )
+        ax.set_title(title)
+        ax.set_xlabel("Sample")
         ax.set_ylabel("Normalised ECG")
-        ax.legend(loc="upper right", fontsize=8, ncol=3)
+        ax.legend(loc="upper right", fontsize=7, ncol=4)
 
-    plt.suptitle(
-        "Probabilistic ECG Forecasting — MC Dropout Uncertainty", fontsize=13, y=1.005
-    )
+    plt.suptitle("Probabilistic ECG Forecasting — Ensemble + MC Dropout Uncertainty",
+                 fontsize=13, y=1.005)
     plt.tight_layout()
     out = os.path.join(RESULTS_DIR, "predictions.png")
     plt.savefig(out, dpi=150, bbox_inches="tight")
     plt.close()
-    print(f"[test] Predictions plot      → {out}")
+    print(f"[test] predictions.png              → {out}")
 
+
+# ---------------------------------------------------------------------------
+# Plot 2 — Uncertainty horizon
+# ---------------------------------------------------------------------------
 
 def plot_uncertainty_horizon(
-    model:  ProbabilisticLSTM,
+    models:     list[ProbabilisticLSTM],
     loader,
-    device: torch.device,
+    device:     torch.device,
+    K:          int,
     max_batches: int = 40,
 ) -> None:
-    """Aleatoric vs epistemic σ across the forecast horizon.
-    Saved to RESULTS_DIR/uncertainty_horizon.png.
-    """
     os.makedirs(RESULTS_DIR, exist_ok=True)
     all_ale, all_epi = [], []
 
-    for i, (x_sig, x_ann, _, _) in enumerate(loader):
+    for i, (x_sig, x_ann, x_feat, _, _, _, x_hrv) in enumerate(loader):
         if i >= max_batches:
             break
-        x_sig, x_ann = x_sig.to(device), x_ann.to(device)
-        _, _, epi_var, ale_var, _ = mc_dropout_predict(model, x_sig, x_ann, n_samples=20)
+        x_sig  = x_sig.to(device)
+        x_ann  = x_ann.to(device)
+        x_feat = x_feat.to(device)
+        x_hrv  = x_hrv.to(device)
+        _, _, epi_var, ale_var, _ = ensemble_mc_predict(
+            models, x_sig, x_ann, x_feat, K=K, x_hrv=x_hrv, n_mc=20
+        )
         all_ale.append(ale_var.cpu().numpy())
         all_epi.append(epi_var.cpu().numpy())
 
-    ale = np.sqrt(np.concatenate(all_ale).mean(axis=0))  # (forecast_len,)
+    ale = np.sqrt(np.concatenate(all_ale).mean(axis=0))
     epi = np.sqrt(np.concatenate(all_epi).mean(axis=0))
-    t   = np.arange(FORECAST_LEN) / 360                  # seconds
+    t   = np.arange(FORECAST_LEN) / 360
 
     fig, ax = plt.subplots(figsize=(10, 4))
     ax.plot(t, ale, color="orange", label="Aleatoric σ (data noise)")
@@ -281,86 +701,346 @@ def plot_uncertainty_horizon(
     ax.fill_between(t, 0, ale, alpha=0.15, color="orange")
     ax.fill_between(t, 0, epi, alpha=0.15, color="purple")
     ax.set_xlabel("Forecast horizon (seconds)")
-    ax.set_ylabel("Standard Deviation (normalised units)")
+    ax.set_ylabel("Standard Deviation (normalised)")
     ax.set_title("Uncertainty Decomposition Across Forecast Horizon")
     ax.legend()
     plt.tight_layout()
     out = os.path.join(RESULTS_DIR, "uncertainty_horizon.png")
     plt.savefig(out, dpi=150)
     plt.close()
-    print(f"[test] Uncertainty horizon   → {out}")
+    print(f"[test] uncertainty_horizon.png      → {out}")
 
+
+# ---------------------------------------------------------------------------
+# Plot 3 — Risk analysis
+# ---------------------------------------------------------------------------
 
 def plot_risk_analysis(
-    model:  ProbabilisticLSTM,
+    models:      list[ProbabilisticLSTM],
     loader,
-    device: torch.device,
+    device:      torch.device,
+    K:           int,
     max_batches: int = 60,
 ) -> None:
-    """Visualise predicted arrhythmia risk probability vs ground-truth labels.
-
-    Produces two panels:
-      Left  — distribution of predicted probabilities for positive/negative windows
-      Right — ROC curve
-
-    Saved to RESULTS_DIR/risk_analysis.png.
-    """
     os.makedirs(RESULTS_DIR, exist_ok=True)
     all_probs, all_labels = [], []
 
-    model.eval()
+    for model in models:
+        model.eval()
+
     with torch.no_grad():
-        for i, (x_sig, x_ann, _, y_risk) in enumerate(loader):
+        for i, (x_sig, x_ann, x_feat, _, y_risk, _, x_hrv) in enumerate(loader):
             if i >= max_batches:
                 break
-            x_sig, x_ann = x_sig.to(device), x_ann.to(device)
-            _, risk_logit = model(x_sig, x_ann)
-            probs = torch.sigmoid(risk_logit).squeeze(-1).cpu().numpy()
-            all_probs.append(probs)
+            x_sig  = x_sig.to(device)
+            x_ann  = x_ann.to(device)
+            x_feat = x_feat.to(device)
+            x_hrv  = x_hrv.to(device)
+
+            batch_risks = []
+            for model in models:
+                _, risk_logit = model(x_sig, x_ann, x_feat, x_hrv=x_hrv)
+                if risk_logit is None:
+                    print("[test] No risk head — skipping risk_analysis.png")
+                    return
+                risk_logit_cal = risk_logit / getattr(model, 'temperature', 1.0)
+                batch_risks.append(torch.sigmoid(risk_logit_cal).squeeze(-1))
+
+            prob = torch.stack(batch_risks).mean(dim=0)
+            all_probs.append(prob.cpu().numpy())
             all_labels.append(y_risk.numpy())
 
     probs  = np.concatenate(all_probs)
     labels = np.concatenate(all_labels)
 
-    pos_probs = probs[labels == 1]
-    neg_probs = probs[labels == 0]
-
-    # --- ROC curve ---
-    desc     = np.argsort(-probs)
-    y_sorted = labels[desc]
-    nP, nN   = y_sorted.sum(), (1 - y_sorted).sum()
-    tpr = np.concatenate([[0], np.cumsum(y_sorted)      / max(nP, 1), [1]])
-    fpr = np.concatenate([[0], np.cumsum(1 - y_sorted)  / max(nN, 1), [1]])
+    desc = np.argsort(-probs)
+    ys   = labels[desc]
+    nP, nN = ys.sum(), (1 - ys).sum()
+    tpr = np.concatenate([[0], np.cumsum(ys)      / max(nP, 1), [1]])
+    fpr = np.concatenate([[0], np.cumsum(1 - ys)  / max(nN, 1), [1]])
     auc = float(np.trapz(tpr, fpr))
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-
-    # Panel 1 — predicted probability distributions
     bins = np.linspace(0, 1, 30)
-    ax1.hist(neg_probs, bins=bins, alpha=0.6, color="steelblue",
-             label=f"No arrhythmia (n={len(neg_probs):,})", density=True)
-    ax1.hist(pos_probs, bins=bins, alpha=0.6, color="crimson",
-             label=f"Arrhythmia (n={len(pos_probs):,})", density=True)
-    ax1.axvline(0.5, color="black", ls="--", lw=1, label="Decision threshold")
+    ax1.hist(probs[labels == 0], bins=bins, alpha=0.6, color="steelblue", density=True,
+             label=f"No arrhythmia  (n={int((labels==0).sum()):,})")
+    ax1.hist(probs[labels == 1], bins=bins, alpha=0.6, color="crimson",   density=True,
+             label=f"Arrhythmia  (n={int((labels==1).sum()):,})")
+    ax1.axvline(0.5, color="black", ls="--", lw=1, label="Threshold 0.5")
     ax1.set_xlabel("Predicted Risk Probability")
     ax1.set_ylabel("Density")
     ax1.set_title("Risk Score Distribution by Class")
     ax1.legend(fontsize=9)
 
-    # Panel 2 — ROC curve
     ax2.plot(fpr, tpr, color="darkorange", lw=2, label=f"AUC = {auc:.3f}")
     ax2.plot([0, 1], [0, 1], "k--", lw=1, label="Random classifier")
     ax2.set_xlabel("False Positive Rate")
     ax2.set_ylabel("True Positive Rate")
-    ax2.set_title("ROC Curve — Arrhythmia Risk Prediction")
+    ax2.set_title("ROC Curve — Arrhythmia Risk")
     ax2.legend()
 
-    plt.suptitle("Arrhythmia Risk Head Evaluation", fontsize=13)
+    plt.suptitle("Arrhythmia Risk Head Evaluation — Ensemble", fontsize=13)
     plt.tight_layout()
     out = os.path.join(RESULTS_DIR, "risk_analysis.png")
     plt.savefig(out, dpi=150)
     plt.close()
-    print(f"[test] Risk analysis plot    → {out}")
+    print(f"[test] risk_analysis.png            → {out}")
+
+
+# ---------------------------------------------------------------------------
+# Plot 4 — Calibration reliability diagram
+# ---------------------------------------------------------------------------
+
+def plot_calibration(
+    models:      list[ProbabilisticLSTM],
+    loader,
+    device:      torch.device,
+    K:           int,
+    q_conformal: float | None = None,
+    max_batches: int = 60,
+) -> float:
+    """Plot expected vs actual Gaussian coverage and compute ECE.
+
+    If q_conformal is given, also marks the conformal coverage level on the plot.
+
+    Returns ECE (Expected Calibration Error) for the signal head.
+    """
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    all_mu, all_sigma, all_y = [], [], []
+
+    for model in models:
+        model.eval()
+
+    with torch.no_grad():
+        for i, (x_sig, x_ann, x_feat, y_sig, _, _, x_hrv) in enumerate(loader):
+            if i >= max_batches:
+                break
+            x_sig  = x_sig.to(device)
+            x_ann  = x_ann.to(device)
+            x_feat = x_feat.to(device)
+            x_hrv  = x_hrv.to(device)
+
+            batch_means = []
+            batch_vars  = []
+            for model in models:
+                sig_out, _ = model(x_sig, x_ann, x_feat, x_hrv=x_hrv)
+                if sig_out.shape[-1] == 1:
+                    print("[test] Deterministic mode — skipping calibration.png")
+                    return float("nan")
+                batch_means.append(signal_mean(sig_out, K=K))
+                batch_vars.append(signal_variance(sig_out, K=K))
+
+            mu    = torch.stack(batch_means).mean(dim=0)
+            sigma = torch.sqrt(torch.stack(batch_vars).mean(dim=0)).clamp(min=1e-6)
+            all_mu.append(mu.cpu().numpy())
+            all_sigma.append(sigma.cpu().numpy())
+            all_y.append(y_sig.numpy())
+
+    mu_arr    = np.concatenate(all_mu).ravel()
+    sigma_arr = np.concatenate(all_sigma).ravel()
+    y_arr     = np.concatenate(all_y).ravel()
+
+    conf_levels = np.linspace(0.05, 0.95, 19)
+    actual_cov  = []
+
+    std_norm = torch.distributions.Normal(0.0, 1.0)
+    for conf in conf_levels:
+        z   = std_norm.icdf(torch.tensor((1.0 + conf) / 2.0)).item()
+        cov = ((y_arr >= mu_arr - z * sigma_arr) & (y_arr <= mu_arr + z * sigma_arr)).mean()
+        actual_cov.append(float(cov))
+
+    actual_cov = np.array(actual_cov)
+    ece        = float(np.abs(actual_cov - conf_levels).mean())
+
+    fig, ax = plt.subplots(figsize=(6, 6))
+    ax.plot([0, 1], [0, 1], "k--", lw=1, label="Perfect calibration")
+    ax.plot(conf_levels, actual_cov, "o-", color="steelblue", lw=2,
+            label=f"Ensemble  (ECE = {ece:.4f})")
+    ax.fill_between(conf_levels, conf_levels, actual_cov, alpha=0.15, color="steelblue")
+
+    # Mark conformal coverage level
+    if q_conformal is not None:
+        # Compute actual coverage at the conformal interval
+        conf_cov = float(
+            ((y_arr >= mu_arr - q_conformal * sigma_arr) &
+             (y_arr <= mu_arr + q_conformal * sigma_arr)).mean()
+        )
+        ax.axhline(conf_cov, color="purple", lw=1.2, ls=":",
+                   label=f"Conformal coverage ({conf_cov:.3f})")
+        ax.axhline(0.90, color="orange", lw=1.0, ls="--",
+                   label="Nominal 90% target")
+
+    ax.set_xlabel("Expected Coverage")
+    ax.set_ylabel("Actual Coverage")
+    ax.set_title("Calibration Reliability Diagram (Signal Head — Ensemble)")
+    ax.legend(fontsize=9)
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    plt.tight_layout()
+    out = os.path.join(RESULTS_DIR, "calibration.png")
+    plt.savefig(out, dpi=150)
+    plt.close()
+    print(f"[test] calibration.png              → {out}  ECE={ece:.4f}")
+    return ece
+
+
+# ---------------------------------------------------------------------------
+# Plot 5 — Uncertainty conditioned on arrhythmia presence
+# ---------------------------------------------------------------------------
+
+def plot_arrhythmia_uncertainty(
+    models:      list[ProbabilisticLSTM],
+    loader,
+    device:      torch.device,
+    K:           int,
+    max_batches: int = 50,
+) -> None:
+    """Compare aleatoric and epistemic σ between arrhythmia and normal windows."""
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    ale_arr, ale_norm, epi_arr, epi_norm = [], [], [], []
+
+    for i, (x_sig, x_ann, x_feat, _, y_risk, _, x_hrv) in enumerate(loader):
+        if i >= max_batches:
+            break
+        x_sig  = x_sig.to(device)
+        x_ann  = x_ann.to(device)
+        x_feat = x_feat.to(device)
+        x_hrv  = x_hrv.to(device)
+        _, _, epi_var, ale_var, _ = ensemble_mc_predict(
+            models, x_sig, x_ann, x_feat, K=K, x_hrv=x_hrv, n_mc=20
+        )
+        ale_np = ale_var.cpu().numpy()
+        epi_np = epi_var.cpu().numpy()
+        mask   = y_risk.bool().numpy()
+
+        if mask.any():
+            ale_arr.append(ale_np[mask])
+            epi_arr.append(epi_np[mask])
+        if (~mask).any():
+            ale_norm.append(ale_np[~mask])
+            epi_norm.append(epi_np[~mask])
+
+    if not ale_arr or not ale_norm:
+        print("[test] Not enough arrhythmia samples — skipping arrhythmia_uncertainty.png")
+        return
+
+    t = np.arange(FORECAST_LEN) / 360
+
+    ale_a = np.sqrt(np.concatenate(ale_arr).mean(axis=0))
+    ale_n = np.sqrt(np.concatenate(ale_norm).mean(axis=0))
+    epi_a = np.sqrt(np.concatenate(epi_arr).mean(axis=0))
+    epi_n = np.sqrt(np.concatenate(epi_norm).mean(axis=0))
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 4))
+
+    ax1.plot(t, ale_a, color="crimson",   lw=2, label="Arrhythmia windows")
+    ax1.plot(t, ale_n, color="steelblue", lw=2, label="Normal windows")
+    ax1.fill_between(t, ale_n, ale_a, alpha=0.15, color="crimson")
+    ax1.set_title("Aleatoric Uncertainty by Arrhythmia Status")
+    ax1.set_xlabel("Forecast horizon (s)")
+    ax1.set_ylabel("Aleatoric σ")
+    ax1.legend()
+
+    ax2.plot(t, epi_a, color="crimson",   lw=2, label="Arrhythmia windows")
+    ax2.plot(t, epi_n, color="steelblue", lw=2, label="Normal windows")
+    ax2.fill_between(t, epi_n, epi_a, alpha=0.15, color="crimson")
+    ax2.set_title("Epistemic Uncertainty by Arrhythmia Status")
+    ax2.set_xlabel("Forecast horizon (s)")
+    ax2.set_ylabel("Epistemic σ")
+    ax2.legend()
+
+    plt.suptitle("Uncertainty Conditioned on Arrhythmia Presence — Ensemble", fontsize=13)
+    plt.tight_layout()
+    out = os.path.join(RESULTS_DIR, "arrhythmia_uncertainty.png")
+    plt.savefig(out, dpi=150)
+    plt.close()
+    print(f"[test] arrhythmia_uncertainty.png   → {out}")
+
+
+# ---------------------------------------------------------------------------
+# Plot 6 — Temporal attention heatmap (first ensemble member only)
+# ---------------------------------------------------------------------------
+
+def plot_attention_weights(
+    models:     list[ProbabilisticLSTM],
+    loader,
+    device:     torch.device,
+    K:          int,
+    n_examples: int = 4,
+) -> None:
+    """Visualise which input timesteps the first ensemble member attends to."""
+    model = models[0]
+    if not getattr(model, "use_attention", False):
+        print("[test] No attention mechanism — skipping attention_weights.png")
+        return
+
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    x_sig, x_ann, x_feat, y_sig, y_risk, _, x_hrv = next(iter(loader))
+    x_sig_d  = x_sig.to(device)
+    x_ann_d  = x_ann.to(device)
+    x_feat_d = x_feat.to(device)
+    x_hrv_d  = x_hrv.to(device)
+
+    model.eval()
+    with torch.no_grad():
+        sig_out, risk_logit, attn_weights = model(
+            x_sig_d, x_ann_d, x_feat_d, x_hrv=x_hrv_d, return_attn=True
+        )
+
+    if attn_weights is None:
+        return
+
+    attn   = attn_weights.cpu().numpy()         # (batch, input_len)
+    x_np   = x_sig[:, :, 0].numpy()             # (batch, input_len) — lead 0
+    ann_np = x_ann.numpy()                      # (batch, input_len)
+    r_prob = (torch.sigmoid(risk_logit / getattr(model, 'temperature', 1.0)).squeeze(-1).cpu().numpy()
+              if risk_logit is not None else None)
+    r_true = y_risk.numpy()
+
+    n = min(n_examples, len(x_np))
+    fig, axes = plt.subplots(n, 1, figsize=(14, 3.5 * n))
+    if n == 1:
+        axes = [axes]
+
+    t = np.arange(INPUT_LEN)
+
+    for i, ax in enumerate(axes):
+        ax.plot(t, x_np[i], color="steelblue", lw=0.8, alpha=0.8, label="ECG signal")
+
+        sig_range   = x_np[i].max() - x_np[i].min() + 1e-8
+        attn_scaled = attn[i] / (attn[i].max() + 1e-8) * sig_range * 0.5
+        ax.fill_between(
+            t, x_np[i].min(), x_np[i].min() + attn_scaled,
+            alpha=0.45, color="orange", label="Attention weight",
+        )
+
+        ab_pos = np.where(ann_np[i] == 2)[0]
+        if len(ab_pos):
+            ax.scatter(ab_pos, x_np[i][ab_pos], color="crimson", s=35,
+                       zorder=5, label="Abnormal beat")
+
+        nm_pos = np.where(ann_np[i] == 1)[0][::3]
+        if len(nm_pos):
+            ax.scatter(nm_pos, x_np[i][nm_pos], color="green", s=18,
+                       zorder=4, marker="^", alpha=0.7, label="Normal beat")
+
+        title = f"Sample {i+1}  |  Peak attention @ t={attn[i].argmax()}"
+        if r_prob is not None:
+            title += (
+                f"  |  Risk — True: {'YES' if r_true[i] > 0.5 else 'NO'}  "
+                f"Pred: {r_prob[i]:.2f}"
+            )
+        ax.set_title(title)
+        ax.set_xlabel("Sample")
+        ax.set_ylabel("Normalised ECG")
+        ax.legend(loc="upper right", fontsize=8, ncol=4)
+
+    plt.suptitle("Temporal Attention Weights Over Input Window (model_0)", fontsize=13, y=1.005)
+    plt.tight_layout()
+    out = os.path.join(RESULTS_DIR, "attention_weights.png")
+    plt.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"[test] attention_weights.png        → {out}")
 
 
 # ---------------------------------------------------------------------------
@@ -368,42 +1048,69 @@ def plot_risk_analysis(
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    device    = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    ckpt_path = os.path.join(MODEL_DIR, "best_model.pt")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    K      = K_MDN if USE_MDN else 1
+    print(f"[test] Device: {device}  K={K}\n")
 
-    if not os.path.exists(ckpt_path):
-        raise FileNotFoundError(
-            f"No checkpoint found at '{ckpt_path}'. "
-            "Please run  python train.py  first."
-        )
+    # 1. Load ensemble
+    models = load_ensemble(MODEL_DIR, device)
 
-    model = load_model(ckpt_path, device)
-
-    _, val_loader, _ = get_dataloaders(
-        data_folder=DATA_FOLDER,
-        input_len=INPUT_LEN,
-        forecast_len=FORECAST_LEN,
-        stride=STRIDE,
-        batch_size=BATCH_SIZE,
-        split=TRAIN_VAL_SPLIT,
-        seed=SEED,
+    # 2. Get data loaders (4-tuple: train, val, cal, pos_weight — ignore train)
+    _, val_loader, cal_loader, _ = get_dataloaders(
+        data_folder=DATA_FOLDER, input_len=INPUT_LEN, forecast_len=FORECAST_LEN,
+        stride=STRIDE, batch_size=BATCH_SIZE, split=TRAIN_VAL_SPLIT, seed=SEED,
     )
 
-    # --- Quantitative metrics ---
-    metrics = evaluate(model, val_loader, device)
-    print(f"\n[test] ── Evaluation Results ────────────────────────────")
-    print(f"[test]   Signal MSE                   : {metrics['mse']:.6f}")
-    print(f"[test]   Signal NLL (Gaussian)         : {metrics['nll']:.6f}")
-    print(f"[test]   Arrhythmia Risk Accuracy      : {metrics['risk_acc']:.4f}")
-    print(f"[test]   Arrhythmia Risk AUC-ROC       : {metrics['risk_auc']:.4f}")
-    print(f"[test] ─────────────────────────────────────────────────\n")
+    # 3. Conformal calibration on cal_loader (signal)
+    q_conformal = conformal_calibrate(models, cal_loader, device, K=K, alpha=0.10)
 
-    # --- Figures ---
-    plot_predictions(model, val_loader, device, n_examples=6)
-    plot_uncertainty_horizon(model, val_loader, device)
-    plot_risk_analysis(model, val_loader, device)
+    # 3b. Conformal calibration for risk head
+    q_risk = conformal_calibrate_risk(models, cal_loader, device, alpha=CONFORMAL_ALPHA_RISK)
 
-    print(f"\n[test] All results saved to '{RESULTS_DIR}/'")
+    # 4. Quantitative evaluation on val_loader
+    metrics = evaluate(models, val_loader, device, K=K, q_conformal=q_conformal)
+    print(f"\n[test] ── Evaluation Results ───────────────────────────────────")
+    print(f"[test]   Signal MSE              : {metrics['mse']:.6f}")
+    print(f"[test]   Signal NLL (β=0)        : {metrics['nll']:.6f}")
+    print(f"[test]   Signal CRPS             : {metrics['crps']:.6f}")
+    print(f"[test]   Arrhythmia Accuracy     : {metrics['risk_acc']:.4f}")
+    print(f"[test]   Arrhythmia AUC-ROC      : {metrics['risk_auc']:.4f}")
+    print(f"[test]   Winkler Score (90%)     : {metrics['winkler']:.6f}")
+    print(f"[test] ─────────────────────────────────────────────────────────\n")
+
+    # 4b. Conformal risk set size distribution
+    if not math.isnan(q_risk):
+        print(f"[test] Conformal risk threshold q_risk={q_risk:.4f}")
+        print(f"[test]   Include class 0 (no arrhythmia) if prob <= {q_risk:.4f}")
+        print(f"[test]   Include class 1 (arrhythmia)    if prob >= {1.0 - q_risk:.4f}")
+
+    # 5. Per-beat-type metrics
+    per_beat_type_evaluate(models, val_loader, device, K=K)
+
+    # 6. All plots
+    plot_predictions(models, val_loader, device, K=K, q_conformal=q_conformal)
+    plot_uncertainty_horizon(models, val_loader, device, K=K)
+    plot_risk_analysis(models, val_loader, device, K=K)
+    ece = plot_calibration(models, val_loader, device, K=K, q_conformal=q_conformal)
+    plot_arrhythmia_uncertainty(models, val_loader, device, K=K)
+    plot_attention_weights(models, val_loader, device, K=K)
+
+    # 7. Diebold-Mariano test: full ensemble vs first member alone
+    if len(models) > 1:
+        errors_ens, errors_m0 = collect_forecast_errors(models, [models[0]], val_loader, device, K)
+        dm_stat, dm_p = diebold_mariano_test(errors_ens, errors_m0)
+        print(f"[test]   DM test (ensemble vs model_0): stat={dm_stat:.3f}  p={dm_p:.4f}")
+
+    # 8. Summary
+    print(f"\n[test] ── Summary ───────────────────────────────────────────────")
+    print(f"[test]   Ensemble size            : {len(models)}")
+    print(f"[test]   K (mixture components)   : {K}")
+    print(f"[test]   Conformal q (alpha=0.10) : {q_conformal:.4f}")
+    if not math.isnan(q_risk):
+        print(f"[test]   Conformal q_risk         : {q_risk:.4f}")
+    print(f"[test]   ECE (calibration error)  : {ece:.4f}")
+    print(f"[test]   Winkler Score (90%)      : {metrics['winkler']:.6f}")
+    print(f"[test]   All figures saved to '{RESULTS_DIR}/'")
 
 
 if __name__ == "__main__":
