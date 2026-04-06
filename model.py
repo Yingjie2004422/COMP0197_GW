@@ -225,6 +225,7 @@ class ProbabilisticLSTM(nn.Module):
         use_risk_head:    bool  = USE_RISK_HEAD,
         deterministic:    bool  = DETERMINISTIC,
         K:                int   = 1,
+        num_heads:       int   =  N_ATTN_HEADS
     ) -> None:
         super().__init__()
 
@@ -234,6 +235,7 @@ class ProbabilisticLSTM(nn.Module):
         self.use_risk_head   = use_risk_head
         self.deterministic   = deterministic
         self.K               = K
+        self.num_heads       = num_heads
 
         # Beat-type embedding.
         # padding_idx=0 keeps the "no beat" token as the zero vector.
