@@ -57,6 +57,7 @@ from config import (
     EARLY_STOPPING_PATIENCE, USE_MDN, K_MDN, N_ENSEMBLE,
     USE_FOCAL_LOSS, USE_CRPS_LOSS, CURRICULUM_EPOCHS,
     LR_T0, LR_T_MULT, INPUT_CHANNELS,
+    TEACHER_FORCING_START, TEACHER_FORCING_END,
 )
 from dataset import get_dataloaders
 from model import ProbabilisticLSTM, combined_loss
@@ -66,23 +67,34 @@ from model import ProbabilisticLSTM, combined_loss
 # Data augmentation
 # ---------------------------------------------------------------------------
 
-def augment(x_sig: torch.Tensor) -> torch.Tensor:
+def augment(
+    x_sig:  torch.Tensor,
+    x_feat: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply randomised augmentations to a training batch of ECG windows.
 
     Applied per-batch during training only — validation data is never augmented.
+    x_feat is updated alongside x_sig to keep features consistent with the
+    augmented signal (amplitude changes propagate to peak_amp / dAmp channels).
 
     Augmentations (each applied independently with stated probability):
         Gaussian noise   (p=0.5) : σ_noise ∈ U[0, 0.05]
-        Amplitude scale  (p=0.3) : scale   ∈ U[0.90, 1.10]
+        Amplitude scale  (p=0.3) : scale   ∈ U[0.90, 1.10];
+                                   also scales x_feat[:, :, 2:4] (peak_amp, dAmp)
         Baseline wander  (p=0.3) : low-frequency sine, amp ∈ U[0, 0.10]
+        Time masking     (p=0.4) : 1-2 random segments zeroed (SpecAugment-style)
     """
     if torch.rand(1).item() < 0.5:
         noise = torch.rand(1).item() * 0.05
         x_sig = x_sig + torch.randn_like(x_sig) * noise
 
     if torch.rand(1).item() < 0.3:
-        scale = 0.90 + torch.rand(1).item() * 0.20
-        x_sig = x_sig * scale
+        scale  = 0.90 + torch.rand(1).item() * 0.20
+        x_sig  = x_sig * scale
+        # Keep peak_amp (ch 2) and dAmp (ch 3) consistent with scaled signal
+        x_feat = x_feat.clone()
+        x_feat[:, :, 2] = x_feat[:, :, 2] * scale
+        x_feat[:, :, 3] = x_feat[:, :, 3] * scale
 
     if torch.rand(1).item() < 0.3:
         seq_len = x_sig.shape[1]
@@ -92,7 +104,18 @@ def augment(x_sig: torch.Tensor) -> torch.Tensor:
         wander  = amp * torch.sin(freq * t).view(1, -1, 1)
         x_sig   = x_sig + wander
 
-    return x_sig
+    # Time masking: zero out 1–2 contiguous segments (SpecAugment-style)
+    if torch.rand(1).item() < 0.4:
+        seq_len = x_sig.shape[1]
+        n_masks = 1 + int(torch.rand(1).item() * 2)
+        x_feat  = x_feat.clone() if not x_feat.is_contiguous() else x_feat.clone()
+        for _ in range(n_masks):
+            mask_w = max(1, int(seq_len * (0.05 + torch.rand(1).item() * 0.10)))
+            start  = int(torch.rand(1).item() * max(1, seq_len - mask_w))
+            x_sig[:, start:start + mask_w, :] = 0.0
+            x_feat[:, start:start + mask_w, :] = 0.0
+
+    return x_sig, x_feat
 
 
 # ---------------------------------------------------------------------------
@@ -214,9 +237,9 @@ def run_epoch(
             y_risk = y_risk.to(device)
             x_hrv  = x_hrv.to(device)
 
-            # Augment signal during training only
+            # Augment signal (and consistent features) during training only
             if training and AUGMENT_TRAIN:
-                x_sig = augment(x_sig)
+                x_sig, x_feat = augment(x_sig, x_feat)
 
             if training:
                 optimizer.zero_grad()
@@ -325,6 +348,12 @@ def train_single(
     for epoch in range(1, NUM_EPOCHS + 1):
         # Curriculum: use normal-only loader for early epochs
         active_loader = normal_loader if epoch <= CURRICULUM_EPOCHS else train_loader
+
+        # Scheduled teacher forcing: linearly anneal from START → END over training
+        progress = (epoch - 1) / max(NUM_EPOCHS - 1, 1)
+        model.teacher_forcing_ratio = (
+            TEACHER_FORCING_START + progress * (TEACHER_FORCING_END - TEACHER_FORCING_START)
+        )
 
         tr = run_epoch(model, active_loader, optimizer, device, pw_tensor,
                        training=True,  K=K)

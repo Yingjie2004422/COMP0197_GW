@@ -25,7 +25,7 @@ RESULTS_DIR = "results"
 
 # --- Signal parameters ---
 SAMPLING_RATE = 360         # MIT-BIH records are sampled at 360 Hz
-INPUT_LEN     = 360         # 1 second of past ECG + annotations fed to the model
+INPUT_LEN     = 720         # 2 seconds of past ECG + annotations fed to the model
 FORECAST_LEN  = 180         # 0.5 seconds of future ECG to predict
 STRIDE        = 180         # 50% window overlap; balance diversity vs dataset size
 
@@ -121,9 +121,13 @@ INPUT_CHANNELS = 2
 # Number of HRV scalar features computed per input window: SDNN, RMSSD, pNN50.
 N_HRV_FEATURES = 3
 
-# --- Seq2Seq decoder teacher forcing ---
-# Probability of using ground-truth target as next decoder input during training.
-TEACHER_FORCING_RATIO = 0.5
+# --- Seq2Seq decoder teacher forcing (scheduled) ---
+# Linearly annealed from TEACHER_FORCING_START (epoch 1) to TEACHER_FORCING_END
+# (final epoch).  High ratio early = stable gradient signal; low ratio late =
+# reduces exposure bias so the model learns to chain its own predictions.
+TEACHER_FORCING_RATIO = 0.5   # default / fallback (overridden by schedule)
+TEACHER_FORCING_START = 0.90
+TEACHER_FORCING_END   = 0.10
 
 # --- Label smoothing for risk head ---
 # Soft targets: y_smooth = y * (1 - eps) + 0.5 * eps

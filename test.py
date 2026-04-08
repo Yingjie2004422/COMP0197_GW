@@ -355,6 +355,56 @@ def winkler_score(
 
 
 # ---------------------------------------------------------------------------
+# Optimal classification threshold (Youden's J index)
+# ---------------------------------------------------------------------------
+
+def find_optimal_threshold(probs: np.ndarray, labels: np.ndarray) -> float:
+    """Find the decision threshold that maximises Youden's J index.
+
+    Youden's J = sensitivity + specificity − 1  =  TPR + TNR − 1  =  TPR − FPR
+
+    Scans 199 candidate thresholds in [0.01, 0.99] and picks the one that
+    maximises J.  Equivalent to finding the point on the ROC curve farthest
+    above the diagonal.
+
+    Parameters
+    ----------
+    probs  : (n,) predicted probability of positive class
+    labels : (n,) binary ground-truth labels {0, 1}
+
+    Returns
+    -------
+    float : optimal threshold t* ∈ [0.01, 0.99]
+    """
+    nP = float(labels.sum())
+    nN = float(len(labels) - nP)
+    if nP == 0 or nN == 0:
+        return 0.5
+
+    best_j, best_t = -1.0, 0.5
+    for t in np.linspace(0.01, 0.99, 199):
+        pred = (probs >= t).astype(float)
+        tpr  = (pred * labels).sum() / nP
+        tnr  = ((1 - pred) * (1 - labels)).sum() / nN
+        j    = tpr + tnr - 1.0
+        if j > best_j:
+            best_j, best_t = j, float(t)
+    return best_t
+
+
+def f1_at_threshold(probs: np.ndarray, labels: np.ndarray, t: float) -> tuple[float, float, float]:
+    """Return (precision, recall, F1) at a given threshold."""
+    pred = (probs >= t).astype(float)
+    tp   = (pred * labels).sum()
+    fp   = (pred * (1 - labels)).sum()
+    fn   = ((1 - pred) * labels).sum()
+    prec = tp / max(tp + fp, 1e-9)
+    rec  = tp / max(tp + fn, 1e-9)
+    f1   = 2 * prec * rec / max(prec + rec, 1e-9)
+    return float(prec), float(rec), float(f1)
+
+
+# ---------------------------------------------------------------------------
 # AUC-ROC (pure numpy)
 # ---------------------------------------------------------------------------
 
@@ -502,13 +552,33 @@ def evaluate(
     probs  = np.concatenate(all_probs)  if all_probs  else np.array([])
     labels = np.concatenate(all_labels) if all_labels else np.array([])
 
+    # --- Threshold selection ---
+    if len(probs):
+        opt_t          = find_optimal_threshold(probs, labels)
+        prec, rec, f1  = f1_at_threshold(probs, labels, opt_t)
+        _, _, f1_half  = f1_at_threshold(probs, labels, 0.5)
+        acc_opt        = float(((probs >= opt_t) == labels).mean())
+        acc_half       = float(((probs >= 0.5)   == labels).mean())
+    else:
+        opt_t = 0.5
+        prec = rec = f1 = f1_half = acc_opt = acc_half = float("nan")
+
     result = {
-        "mse":      total_mse  / n_batches,
-        "nll":      total_nll  / n_nll    if n_nll   else float("nan"),
-        "crps":     total_crps / n_nll    if n_nll   else float("nan"),
-        "risk_acc": float(((probs >= 0.5) == labels).mean()) if len(probs) else float("nan"),
-        "risk_auc": roc_auc(labels, probs)                   if len(probs) else float("nan"),
-        "winkler":  float("nan"),
+        "mse":          total_mse  / n_batches,
+        "nll":          total_nll  / n_nll    if n_nll   else float("nan"),
+        "crps":         total_crps / n_nll    if n_nll   else float("nan"),
+        # fixed-threshold metrics
+        "risk_acc":     acc_half,
+        "risk_f1_half": f1_half,
+        # Youden-optimal threshold metrics
+        "opt_thresh":   opt_t,
+        "risk_acc_opt": acc_opt,
+        "risk_prec":    prec,
+        "risk_recall":  rec,
+        "risk_f1":      f1,
+        # AUC (threshold-free)
+        "risk_auc":     roc_auc(labels, probs) if len(probs) else float("nan"),
+        "winkler":      float("nan"),
     }
 
     if q_conformal is not None and all_mu:
@@ -720,8 +790,14 @@ def plot_risk_analysis(
     loader,
     device:      torch.device,
     K:           int,
+    opt_thresh:  float = 0.5,
     max_batches: int = 60,
 ) -> None:
+    """Plot risk score distribution and ROC curve.
+
+    opt_thresh : Youden's-J optimal threshold computed by evaluate();
+                 shown alongside the 0.5 baseline on the distribution plot.
+    """
     os.makedirs(RESULTS_DIR, exist_ok=True)
     all_probs, all_labels = [], []
 
@@ -753,6 +829,7 @@ def plot_risk_analysis(
     probs  = np.concatenate(all_probs)
     labels = np.concatenate(all_labels)
 
+    # ROC curve
     desc = np.argsort(-probs)
     ys   = labels[desc]
     nP, nN = ys.sum(), (1 - ys).sum()
@@ -760,26 +837,38 @@ def plot_risk_analysis(
     fpr = np.concatenate([[0], np.cumsum(1 - ys)  / max(nN, 1), [1]])
     auc = float(np.trapz(tpr, fpr))
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    # Youden's J on ROC curve to mark optimal operating point
+    j_idx   = np.argmax(tpr - fpr)
+    opt_fpr = float(fpr[j_idx])
+    opt_tpr = float(tpr[j_idx])
+
+    # F1 at both thresholds for legend
+    _, _, f1_opt  = f1_at_threshold(probs, labels, opt_thresh)
+    _, _, f1_half = f1_at_threshold(probs, labels, 0.5)
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5))
     bins = np.linspace(0, 1, 30)
     ax1.hist(probs[labels == 0], bins=bins, alpha=0.6, color="steelblue", density=True,
              label=f"No arrhythmia  (n={int((labels==0).sum()):,})")
     ax1.hist(probs[labels == 1], bins=bins, alpha=0.6, color="crimson",   density=True,
              label=f"Arrhythmia  (n={int((labels==1).sum()):,})")
-    ax1.axvline(0.5, color="black", ls="--", lw=1, label="Threshold 0.5")
+    ax1.axvline(0.5,       color="black",  ls="--", lw=1.2, label=f"0.5 baseline  (F1={f1_half:.3f})")
+    ax1.axvline(opt_thresh, color="green", ls="--", lw=1.5, label=f"Youden optimal t={opt_thresh:.2f}  (F1={f1_opt:.3f})")
     ax1.set_xlabel("Predicted Risk Probability")
     ax1.set_ylabel("Density")
     ax1.set_title("Risk Score Distribution by Class")
-    ax1.legend(fontsize=9)
+    ax1.legend(fontsize=8)
 
     ax2.plot(fpr, tpr, color="darkorange", lw=2, label=f"AUC = {auc:.3f}")
     ax2.plot([0, 1], [0, 1], "k--", lw=1, label="Random classifier")
+    ax2.scatter([opt_fpr], [opt_tpr], color="green", zorder=5, s=80,
+                label=f"Youden J point  t={opt_thresh:.2f}")
     ax2.set_xlabel("False Positive Rate")
     ax2.set_ylabel("True Positive Rate")
     ax2.set_title("ROC Curve — Arrhythmia Risk")
-    ax2.legend()
+    ax2.legend(fontsize=9)
 
-    plt.suptitle("Arrhythmia Risk Head Evaluation — Ensemble", fontsize=13)
+    plt.suptitle("Arrhythmia Risk Head Evaluation — Ensemble + Youden's J Threshold", fontsize=13)
     plt.tight_layout()
     out = os.path.join(RESULTS_DIR, "risk_analysis.png")
     plt.savefig(out, dpi=150)
@@ -1069,13 +1158,17 @@ def main() -> None:
 
     # 4. Quantitative evaluation on val_loader
     metrics = evaluate(models, val_loader, device, K=K, q_conformal=q_conformal)
+    opt_t   = metrics["opt_thresh"]
     print(f"\n[test] ── Evaluation Results ───────────────────────────────────")
     print(f"[test]   Signal MSE              : {metrics['mse']:.6f}")
     print(f"[test]   Signal NLL (β=0)        : {metrics['nll']:.6f}")
     print(f"[test]   Signal CRPS             : {metrics['crps']:.6f}")
-    print(f"[test]   Arrhythmia Accuracy     : {metrics['risk_acc']:.4f}")
-    print(f"[test]   Arrhythmia AUC-ROC      : {metrics['risk_auc']:.4f}")
     print(f"[test]   Winkler Score (90%)     : {metrics['winkler']:.6f}")
+    print(f"[test] ── Arrhythmia Classification ─────────────────────────────")
+    print(f"[test]   AUC-ROC                 : {metrics['risk_auc']:.4f}")
+    print(f"[test]   Threshold = 0.50 ·  Acc={metrics['risk_acc']:.4f}  F1={metrics['risk_f1_half']:.4f}")
+    print(f"[test]   Youden J  t={opt_t:.3f}·  Acc={metrics['risk_acc_opt']:.4f}  "
+          f"Prec={metrics['risk_prec']:.4f}  Recall={metrics['risk_recall']:.4f}  F1={metrics['risk_f1']:.4f}")
     print(f"[test] ─────────────────────────────────────────────────────────\n")
 
     # 4b. Conformal risk set size distribution
@@ -1090,7 +1183,7 @@ def main() -> None:
     # 6. All plots
     plot_predictions(models, val_loader, device, K=K, q_conformal=q_conformal)
     plot_uncertainty_horizon(models, val_loader, device, K=K)
-    plot_risk_analysis(models, val_loader, device, K=K)
+    plot_risk_analysis(models, val_loader, device, K=K, opt_thresh=opt_t)
     ece = plot_calibration(models, val_loader, device, K=K, q_conformal=q_conformal)
     plot_arrhythmia_uncertainty(models, val_loader, device, K=K)
     plot_attention_weights(models, val_loader, device, K=K)

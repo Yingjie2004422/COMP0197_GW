@@ -229,13 +229,15 @@ class ProbabilisticLSTM(nn.Module):
     ) -> None:
         super().__init__()
 
-        self.forecast_len    = forecast_len
-        self.use_attention   = use_attention
-        self.use_rr_features = use_rr_features
-        self.use_risk_head   = use_risk_head
-        self.deterministic   = deterministic
-        self.K               = K
-        self.num_heads       = num_heads
+        self.forecast_len           = forecast_len
+        self.use_attention          = use_attention
+        self.use_rr_features        = use_rr_features
+        self.use_risk_head          = use_risk_head
+        self.deterministic          = deterministic
+        self.K                      = K
+        self.num_heads              = num_heads
+        # Mutable so train.py can apply the scheduled annealing schedule
+        self.teacher_forcing_ratio  = TEACHER_FORCING_RATIO
 
         # Beat-type embedding.
         # padding_idx=0 keeps the "no beat" token as the zero vector.
@@ -362,7 +364,7 @@ class ProbabilisticLSTM(nn.Module):
             outputs.append(step_out)
 
             # Next decoder input
-            if use_tf and torch.rand(1).item() < TEACHER_FORCING_RATIO:
+            if use_tf and torch.rand(1).item() < self.teacher_forcing_ratio:
                 dec_inp = y_signal[:, t:t+1].unsqueeze(-1)  # (batch, 1, 1)
             else:
                 if self.K > 1:
