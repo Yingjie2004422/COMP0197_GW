@@ -430,6 +430,9 @@ class ECGAugmentedDataset(Dataset):
 
         self.sample_weights = self._build_balanced_weights()
         self.bucket_summary = {k: len(v) for k, v in self.bucket_to_indices.items()}
+        self.normal_indices = [
+            i for i, subtype in enumerate(self.window_subtypes) if subtype == WINDOW_SUBTYPES["normal"]
+        ]
 
     def _build_balanced_weights(self) -> torch.DoubleTensor:
         n = len(self._index)

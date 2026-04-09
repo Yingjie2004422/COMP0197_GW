@@ -59,7 +59,7 @@ from config import (
     LR_T0, LR_T_MULT, INPUT_CHANNELS,
     TEACHER_FORCING_START, TEACHER_FORCING_END,
 )
-from dataset import get_dataloaders
+from dataset_augmented import get_augmented_dataloaders, WINDOW_SUBTYPES
 from model import ProbabilisticLSTM, combined_loss
 
 
@@ -175,9 +175,12 @@ def fit_temperature(model, val_loader, device) -> float:
     all_logits, all_labels = [], []
     model.eval()
     with torch.no_grad():
-        for x_sig, x_ann, x_feat, y_sig, y_risk, _, x_hrv in val_loader:
-            x_sig  = x_sig.to(device);  x_ann  = x_ann.to(device)
-            x_feat = x_feat.to(device); x_hrv  = x_hrv.to(device)
+        for batch in val_loader:
+            x_sig  = batch["x_signal"].to(device)
+            x_ann  = batch["x_annot"].to(device)
+            x_feat = batch["x_feat"].to(device)
+            x_hrv  = batch["x_hrv"].to(device)
+            y_risk = batch["y_risk"].to(device)
             _, risk_logit = model(x_sig, x_ann, x_feat, x_hrv=x_hrv)
             if risk_logit is None:
                 return 1.0
@@ -220,22 +223,30 @@ def run_epoch(
 ) -> tuple[float, float, float]:
     """One full pass over *loader*.  Returns (total, signal, risk) mean losses.
 
-    The batch is a 7-tuple; y_beat_type (6th element) is unpacked but ignored
-    during training — it is used only at test time for per-beat-type metrics.
-    x_hrv (7th element) is the HRV feature vector passed to the model.
+    The batch is a dict with keys:
+    x_signal, x_annot, x_feat, y_signal, y_risk, x_hrv, x_feat_mask, x_beat_event
+    
+    y_beat_type is unpacked but ignored during training 
+    — it is used only at test time for per-beat-type metrics.
+    x_hrv is the HRV feature vector passed to the model.
+    x_feat_mask and x_beat_event are passed to the model to enable mask-aware dense 
+    feature fusion and beat-event encoding
+
     """
     model.train() if training else model.eval()
     total = sig_sum = risk_sum = 0.0
 
     ctx = torch.enable_grad() if training else torch.no_grad()
     with ctx:
-        for x_sig, x_ann, x_feat, y_sig, y_risk, _, x_hrv in loader:
-            x_sig  = x_sig.to(device)
-            x_ann  = x_ann.to(device)
-            x_feat = x_feat.to(device)
-            y_sig  = y_sig.to(device)
-            y_risk = y_risk.to(device)
-            x_hrv  = x_hrv.to(device)
+        for batch in loader:
+            x_sig        = batch["x_signal"].to(device)
+            x_ann        = batch["x_annot"].to(device)
+            x_feat       = batch["x_feat"].to(device)
+            y_sig        = batch["y_signal"].to(device)
+            y_risk       = batch["y_risk"].to(device)
+            x_hrv        = batch["x_hrv"].to(device)
+            x_feat_mask  = batch["x_feat_mask"].to(device)
+            x_beat_event = batch["x_beat_event"].to(device)
 
             # Augment signal (and consistent features) during training only
             if training and AUGMENT_TRAIN:
@@ -244,7 +255,8 @@ def run_epoch(
             if training:
                 optimizer.zero_grad()
 
-            sig_out, risk_logit = model(x_sig, x_ann, x_feat, x_hrv=x_hrv, y_signal=y_sig)
+            sig_out, risk_logit = model(x_sig, x_ann, x_feat, x_hrv=x_hrv, x_feat_mask=x_feat_mask, 
+                                        x_beat_event=x_beat_event, y_signal=y_sig)
 
             loss, sig_val, risk_val = combined_loss(
                 sig_out, risk_logit, y_sig, y_risk,
@@ -450,11 +462,16 @@ def train() -> None:
     )
 
     # --- Data ---
-    # get_dataloaders returns 4-tuple: train_loader, val_loader, cal_loader, pos_weight
-    train_loader, val_loader, cal_loader, pos_weight = get_dataloaders(
+    # get_augmented_dataloaders returns 4-tuple: train_loader, val_loader, train_ds, val_ds
+    train_loader, val_loader, train_ds, val_ds = get_augmented_dataloaders(
         data_folder=DATA_FOLDER, input_len=INPUT_LEN, forecast_len=FORECAST_LEN,
         stride=STRIDE, batch_size=BATCH_SIZE, split=TRAIN_VAL_SPLIT, seed=SEED,
     )
+    n_pos = sum(1 for s in train_ds.window_subtypes if s in 
+                (WINDOW_SUBTYPES["pre_event"], WINDOW_SUBTYPES["persistent_abnormal"]))
+    n_neg = len(train_ds) - n_pos
+    pos_weight = n_neg / max(n_pos, 1)
+    cal_loader = val_loader
 
     # Build a normal-only loader for curriculum learning.
     # train_loader.dataset is the ECGDataset; Subset restricts to normal_indices.

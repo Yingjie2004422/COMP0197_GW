@@ -52,7 +52,7 @@ from config import (
     MODEL_DIR, RESULTS_DIR, MC_SAMPLES, N_ENSEMBLE,
     USE_MDN, K_MDN, CONFORMAL_ALPHA_RISK,
 )
-from dataset import get_dataloaders
+from dataset_augmented import get_augmented_dataloaders, WINDOW_SUBTYPES
 from model import ProbabilisticLSTM, gaussian_nll_loss, gaussian_crps, signal_mean, signal_variance
 
 
@@ -128,6 +128,8 @@ def ensemble_mc_predict(
     x_feat:  torch.Tensor,
     K:       int,
     x_hrv:   torch.Tensor | None = None,
+    x_feat_mask:  torch.Tensor | None = None,
+    x_beat_event: torch.Tensor | None = None,
     n_mc:    int = MC_SAMPLES,
 ) -> tuple:
     """Combined ensemble + MC Dropout inference.
@@ -141,13 +143,15 @@ def ensemble_mc_predict(
 
     Parameters
     ----------
-    models  : list of ProbabilisticLSTM (loaded ensemble)
-    x_sig   : (batch, input_len, 2)
-    x_ann   : (batch, input_len)
-    x_feat  : (batch, input_len, 4)
-    K       : number of mixture components (from checkpoint config)
-    x_hrv   : (batch, 3) or None
-    n_mc    : MC Dropout samples per ensemble member
+    models       : list of ProbabilisticLSTM (loaded ensemble)
+    x_sig        : (batch, input_len, 2)
+    x_ann        : (batch, input_len)
+    x_feat       : (batch, input_len, 4)
+    K            : number of mixture components (from checkpoint config)
+    x_hrv        : (batch, 3) or None
+    x_feat_mask  : (batch, input_len, 4) or None 
+    x_beat_event : (batch, input_len, 7) or None
+    n_mc         : MC Dropout samples per ensemble member
 
     Returns
     -------
@@ -169,7 +173,8 @@ def ensemble_mc_predict(
 
         with torch.no_grad():
             for _ in range(n_mc):
-                sig_out, risk_logit = model(x_sig, x_ann, x_feat, x_hrv=x_hrv)
+                sig_out, risk_logit = model(x_sig, x_ann, x_feat, x_hrv=x_hrv,
+                                            x_feat_mask=x_feat_mask, x_beat_event=x_beat_event)
                 mu    = signal_mean(sig_out, K=K)
                 var   = signal_variance(sig_out, K=K)
                 mc_means.append(mu)
@@ -228,18 +233,21 @@ def conformal_calibrate(
         model.eval()
 
     with torch.no_grad():
-        for x_sig, x_ann, x_feat, y_sig, _, _, x_hrv in cal_loader:
-            x_sig  = x_sig.to(device)
-            x_ann  = x_ann.to(device)
-            x_feat = x_feat.to(device)
-            x_hrv  = x_hrv.to(device)
-            y_sig  = y_sig.to(device)
+        for batch in cal_loader:
+            x_sig        = batch["x_signal"].to(device)
+            x_ann        = batch["x_annot"].to(device)
+            x_feat       = batch["x_feat"].to(device)
+            x_hrv        = batch["x_hrv"].to(device)
+            y_sig        = batch["y_signal"].to(device)
+            x_feat_mask  = batch["x_feat_mask"].to(device)
+            x_beat_event = batch["x_beat_event"].to(device)
 
             # Average ensemble predictions (single pass, no MC)
             batch_means = []
             batch_vars  = []
             for model in models:
-                sig_out, _ = model(x_sig, x_ann, x_feat, x_hrv=x_hrv)
+                sig_out, _ = model(x_sig, x_ann, x_feat, x_hrv=x_hrv,
+                                   x_feat_mask=x_feat_mask, x_beat_event=x_beat_event)
                 batch_means.append(signal_mean(sig_out, K=K))
                 batch_vars.append(signal_variance(sig_out, K=K))
 
@@ -288,20 +296,24 @@ def conformal_calibrate_risk(
         model.eval()
     with torch.no_grad():
         for batch in cal_loader:
-            x_sig, x_ann, x_feat, _, y_risk, _, x_hrv = batch
-            x_sig  = x_sig.to(device); x_ann  = x_ann.to(device)
-            x_feat = x_feat.to(device); x_hrv  = x_hrv.to(device)
+            x_sig        = batch["x_signal"].to(device)
+            x_ann        = batch["x_annot"].to(device)
+            x_feat       = batch["x_feat"].to(device)
+            x_hrv        = batch["x_hrv"].to(device)
+            y_risk       = batch["y_risk"].numpy()
+            x_feat_mask  = batch["x_feat_mask"].to(device)
+            x_beat_event = batch["x_beat_event"].to(device)
             batch_probs = []
             for model in models:
-                _, risk_logit = model(x_sig, x_ann, x_feat, x_hrv=x_hrv)
+                _, risk_logit = model(x_sig, x_ann, x_feat, x_hrv=x_hrv,
+                                      x_feat_mask=x_feat_mask, x_beat_event=x_beat_event)
                 if risk_logit is None:
                     return float("nan")
                 logit_cal = risk_logit / getattr(model, 'temperature', 1.0)
                 batch_probs.append(torch.sigmoid(logit_cal).squeeze(-1))
             prob = torch.stack(batch_probs).mean(dim=0).cpu().numpy()
-            labels = y_risk.numpy()
             # nonconformity score: 1 - p(true class)
-            nc_score = np.where(labels > 0.5, 1.0 - prob, prob)
+            nc_score = np.where(y_risk > 0.5, 1.0 - prob, prob)
             scores.append(nc_score)
 
     scores = np.concatenate(scores)
@@ -451,13 +463,20 @@ def collect_forecast_errors(models_a, models_b, loader, device, K, max_batches=6
         errs = []
         for m in models: m.eval()
         with torch.no_grad():
-            for i, (x_sig, x_ann, x_feat, y_sig, _, _, x_hrv) in enumerate(loader):
-                if i >= max_batches: break
-                x_sig  = x_sig.to(device); x_ann  = x_ann.to(device)
-                x_feat = x_feat.to(device); x_hrv  = x_hrv.to(device)
+            for i, batch in enumerate(loader):
+                if i >= max_batches: 
+                    break
+                x_sig        = batch["x_signal"].to(device)
+                x_ann        = batch["x_annot"].to(device)
+                x_feat       = batch["x_feat"].to(device)
+                y_sig        = batch["y_signal"].to(device)
+                x_hrv        = batch["x_hrv"].to(device)
+                x_feat_mask  = batch["x_feat_mask"].to(device)
+                x_beat_event = batch["x_beat_event"].to(device)
                 means = []
                 for m in models:
-                    sig_out, _ = m(x_sig, x_ann, x_feat, x_hrv=x_hrv)
+                    sig_out, _ = m(x_sig, x_ann, x_feat, x_hrv=x_hrv,
+                                   x_feat_mask=x_feat_mask, x_beat_event=x_beat_event)
                     means.append(signal_mean(sig_out, K=K))
                 mu = torch.stack(means).mean(0)
                 errs.append(((mu - y_sig.to(device))**2).mean(-1).cpu().numpy())
@@ -500,13 +519,15 @@ def evaluate(
     all_mu, all_sigma, all_y = [], [], []
 
     with torch.no_grad():
-        for x_sig, x_ann, x_feat, y_sig, y_risk, _, x_hrv in loader:
-            x_sig  = x_sig.to(device)
-            x_ann  = x_ann.to(device)
-            x_feat = x_feat.to(device)
-            x_hrv  = x_hrv.to(device)
-            y_sig  = y_sig.to(device)
-            y_risk = y_risk.to(device)
+        for batch in loader:
+            x_sig        = batch["x_signal"].to(device)
+            x_ann        = batch["x_annot"].to(device)
+            x_feat       = batch["x_feat"].to(device)
+            y_sig        = batch["y_signal"].to(device)
+            y_risk       = batch["y_risk"].to(device)
+            x_hrv        = batch["x_hrv"].to(device)
+            x_feat_mask  = batch["x_feat_mask"].to(device)
+            x_beat_event = batch["x_beat_event"].to(device)
 
             # Average over ensemble members
             batch_means  = []
@@ -515,7 +536,8 @@ def evaluate(
             batch_sig_out_k1 = []   # keep first K=1-equivalent output for CRPS/NLL
 
             for model in models:
-                sig_out, risk_logit = model(x_sig, x_ann, x_feat, x_hrv=x_hrv)
+                sig_out, risk_logit = model(x_sig, x_ann, x_feat, x_hrv=x_hrv,
+                                            x_feat_mask=x_feat_mask, x_beat_event=x_beat_event)
                 batch_means.append(signal_mean(sig_out, K=K))
                 batch_vars.append(signal_variance(sig_out, K=K))
                 if K == 1:
@@ -616,17 +638,21 @@ def per_beat_type_evaluate(
     mse_by_type: dict[int, list] = {t: [] for t in range(5)}
 
     with torch.no_grad():
-        for x_sig, x_ann, x_feat, y_sig, _, y_beat_type, x_hrv in loader:
-            x_sig  = x_sig.to(device)
-            x_ann  = x_ann.to(device)
-            x_feat = x_feat.to(device)
-            x_hrv  = x_hrv.to(device)
-            y_sig  = y_sig.to(device)
+        for batch in loader:
+            x_sig        = batch["x_signal"].to(device)
+            x_ann        = batch["x_annot"].to(device)
+            x_feat       = batch["x_feat"].to(device)
+            y_sig        = batch["y_signal"].to(device)
+            x_hrv        = batch["x_hrv"].to(device)
+            y_beat_type  = batch["y_beat_type"]
+            x_feat_mask  = batch["x_feat_mask"].to(device)
+            x_beat_event = batch["x_beat_event"].to(device)
 
             # Ensemble mean
             batch_means = []
             for model in models:
-                sig_out, _ = model(x_sig, x_ann, x_feat, x_hrv=x_hrv)
+                sig_out, _ = model(x_sig, x_ann, x_feat, x_hrv=x_hrv,
+                                   x_feat_mask=x_feat_mask, x_beat_event=x_beat_event)
                 batch_means.append(signal_mean(sig_out, K=K))
             mu = torch.stack(batch_means).mean(dim=0)   # (batch, T)
 
@@ -667,14 +693,20 @@ def plot_predictions(
     n_examples:  int = 6,
 ) -> None:
     os.makedirs(RESULTS_DIR, exist_ok=True)
-    x_sig, x_ann, x_feat, y_sig, y_risk, _, x_hrv = next(iter(loader))
-    x_sig  = x_sig.to(device)
-    x_ann  = x_ann.to(device)
-    x_feat = x_feat.to(device)
-    x_hrv  = x_hrv.to(device)
+    batch        = next(iter(loader))
+    x_sig        = batch["x_signal"]
+    x_ann        = batch["x_annot"]
+    x_feat       = batch["x_feat"]
+    y_sig        = batch["y_signal"]
+    y_risk       = batch["y_risk"]
+    x_hrv        = batch["x_hrv"]
+    x_feat_mask  = batch["x_feat_mask"]
+    x_beat_event = batch["x_beat_event"]
 
     mean, total_std, epi_var, ale_var, risk_prob = ensemble_mc_predict(
-        models, x_sig, x_ann, x_feat, K=K, x_hrv=x_hrv, n_mc=20
+        models, x_sig.to(device), x_ann.to(device), x_feat.to(device), 
+        K=K, x_hrv=x_hrv.to(device), x_feat_mask=x_feat_mask.to(device), 
+        x_beat_event=x_beat_event.to(device), n_mc=20
     )
     mean      = mean.cpu().numpy()
     total_std = total_std.cpu().numpy()
@@ -748,15 +780,18 @@ def plot_uncertainty_horizon(
     os.makedirs(RESULTS_DIR, exist_ok=True)
     all_ale, all_epi = [], []
 
-    for i, (x_sig, x_ann, x_feat, _, _, _, x_hrv) in enumerate(loader):
+    for i, batch in enumerate(loader):
         if i >= max_batches:
             break
-        x_sig  = x_sig.to(device)
-        x_ann  = x_ann.to(device)
-        x_feat = x_feat.to(device)
-        x_hrv  = x_hrv.to(device)
+        x_sig        = batch["x_signal"].to(device)
+        x_ann        = batch["x_annot"].to(device)
+        x_feat       = batch["x_feat"].to(device)
+        x_hrv        = batch["x_hrv"].to(device)
+        x_feat_mask  = batch["x_feat_mask"].to(device)
+        x_beat_event = batch["x_beat_event"].to(device)
         _, _, epi_var, ale_var, _ = ensemble_mc_predict(
-            models, x_sig, x_ann, x_feat, K=K, x_hrv=x_hrv, n_mc=20
+            models, x_sig, x_ann, x_feat, K=K, x_hrv=x_hrv, 
+            x_feat_mask=x_feat_mask, x_beat_event=x_beat_event, n_mc=20
         )
         all_ale.append(ale_var.cpu().numpy())
         all_epi.append(epi_var.cpu().numpy())
@@ -805,17 +840,21 @@ def plot_risk_analysis(
         model.eval()
 
     with torch.no_grad():
-        for i, (x_sig, x_ann, x_feat, _, y_risk, _, x_hrv) in enumerate(loader):
+        for i, batch in enumerate(loader):
             if i >= max_batches:
                 break
-            x_sig  = x_sig.to(device)
-            x_ann  = x_ann.to(device)
-            x_feat = x_feat.to(device)
-            x_hrv  = x_hrv.to(device)
+            x_sig        = batch["x_signal"].to(device)
+            x_ann        = batch["x_annot"].to(device)
+            x_feat       = batch["x_feat"].to(device)
+            x_hrv        = batch["x_hrv"].to(device)
+            y_risk       = batch["y_risk"]
+            x_feat_mask  = batch["x_feat_mask"].to(device)
+            x_beat_event = batch["x_beat_event"].to(device)
 
             batch_risks = []
             for model in models:
-                _, risk_logit = model(x_sig, x_ann, x_feat, x_hrv=x_hrv)
+                _, risk_logit = model(x_sig, x_ann, x_feat, x_hrv=x_hrv,
+                                    x_feat_mask=x_feat_mask, x_beat_event=x_beat_event)
                 if risk_logit is None:
                     print("[test] No risk head — skipping risk_analysis.png")
                     return
@@ -901,18 +940,22 @@ def plot_calibration(
         model.eval()
 
     with torch.no_grad():
-        for i, (x_sig, x_ann, x_feat, y_sig, _, _, x_hrv) in enumerate(loader):
+        for i, batch in enumerate(loader):
             if i >= max_batches:
                 break
-            x_sig  = x_sig.to(device)
-            x_ann  = x_ann.to(device)
-            x_feat = x_feat.to(device)
-            x_hrv  = x_hrv.to(device)
+            x_sig        = batch["x_signal"].to(device)
+            x_ann        = batch["x_annot"].to(device)
+            x_feat       = batch["x_feat"].to(device)
+            y_sig        = batch["y_signal"]
+            x_hrv        = batch["x_hrv"].to(device)
+            x_feat_mask  = batch["x_feat_mask"].to(device)
+            x_beat_event = batch["x_beat_event"].to(device)
 
             batch_means = []
             batch_vars  = []
             for model in models:
-                sig_out, _ = model(x_sig, x_ann, x_feat, x_hrv=x_hrv)
+                sig_out, _ = model(x_sig, x_ann, x_feat, x_hrv=x_hrv,
+                                   x_feat_mask=x_feat_mask, x_beat_event=x_beat_event)
                 if sig_out.shape[-1] == 1:
                     print("[test] Deterministic mode — skipping calibration.png")
                     return float("nan")
@@ -988,15 +1031,20 @@ def plot_arrhythmia_uncertainty(
     os.makedirs(RESULTS_DIR, exist_ok=True)
     ale_arr, ale_norm, epi_arr, epi_norm = [], [], [], []
 
-    for i, (x_sig, x_ann, x_feat, _, y_risk, _, x_hrv) in enumerate(loader):
+    for i, batch in enumerate(loader):
         if i >= max_batches:
             break
-        x_sig  = x_sig.to(device)
-        x_ann  = x_ann.to(device)
-        x_feat = x_feat.to(device)
-        x_hrv  = x_hrv.to(device)
+        x_sig        = batch["x_signal"].to(device)
+        x_ann        = batch["x_annot"].to(device)
+        x_feat       = batch["x_feat"].to(device)
+        x_hrv        = batch["x_hrv"].to(device)
+        y_risk       = batch["y_risk"]
+        x_feat_mask  = batch["x_feat_mask"].to(device)
+        x_beat_event = batch["x_beat_event"].to(device)
+
         _, _, epi_var, ale_var, _ = ensemble_mc_predict(
-            models, x_sig, x_ann, x_feat, K=K, x_hrv=x_hrv, n_mc=20
+            models, x_sig, x_ann, x_feat, K=K, x_hrv=x_hrv, 
+            x_feat_mask=x_feat_mask, x_beat_event=x_beat_event, n_mc=20
         )
         ale_np = ale_var.cpu().numpy()
         epi_np = epi_var.cpu().numpy()
@@ -1064,7 +1112,15 @@ def plot_attention_weights(
         return
 
     os.makedirs(RESULTS_DIR, exist_ok=True)
-    x_sig, x_ann, x_feat, y_sig, y_risk, _, x_hrv = next(iter(loader))
+    batch        = next(iter(loader))
+    x_sig        = batch["x_signal"]
+    x_ann        = batch["x_annot"]
+    x_feat       = batch["x_feat"]
+    y_sig        = batch["y_signal"]
+    y_risk       = batch["y_risk"]
+    x_hrv        = batch["x_hrv"]
+    x_feat_mask  = batch["x_feat_mask"]
+    x_beat_event = batch["x_beat_event"]
     x_sig_d  = x_sig.to(device)
     x_ann_d  = x_ann.to(device)
     x_feat_d = x_feat.to(device)
@@ -1073,7 +1129,9 @@ def plot_attention_weights(
     model.eval()
     with torch.no_grad():
         sig_out, risk_logit, attn_weights = model(
-            x_sig_d, x_ann_d, x_feat_d, x_hrv=x_hrv_d, return_attn=True
+            x_sig_d, x_ann_d, x_feat_d, x_hrv=x_hrv_d, 
+            x_feat_mask=x_feat_mask.to(device),
+            x_beat_event=x_beat_event.to(device), return_attn=True
         )
 
     if attn_weights is None:
@@ -1144,11 +1202,12 @@ def main() -> None:
     # 1. Load ensemble
     models = load_ensemble(MODEL_DIR, device)
 
-    # 2. Get data loaders (4-tuple: train, val, cal, pos_weight — ignore train)
-    _, val_loader, cal_loader, _ = get_dataloaders(
+    # 2. Get data loaders (4-tuple: train, val, train_ds, val_ds
+    _, val_loader, train_ds, val_ds= get_augmented_dataloaders(
         data_folder=DATA_FOLDER, input_len=INPUT_LEN, forecast_len=FORECAST_LEN,
         stride=STRIDE, batch_size=BATCH_SIZE, split=TRAIN_VAL_SPLIT, seed=SEED,
     )
+    cal_loader = val_loader
 
     # 3. Conformal calibration on cal_loader (signal)
     q_conformal = conformal_calibrate(models, cal_loader, device, K=K, alpha=0.10)

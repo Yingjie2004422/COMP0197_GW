@@ -4,10 +4,13 @@
 # Architecture overview
 # ---------------------
 # Inputs per timestep (concatenated before LSTM):
-#   1. Raw normalised ECG voltage (2 leads)                — (2,)
-#   2. Beat-type embedding (0/1/2 token)                   — (embed_dim,)
-#   3. Beat morphology features [opt.] (4 channels)        — (4,)  if USE_RR_FEATURES
-#      [RR, dRR, peak_amp, dAmp]
+#   1. Raw normalised ECG voltage (2 leads)                                   — (2,)
+#   2. Beat-type embedding (0/1/2 token)                                      — (embed_dim,)
+#   3. Beat morphology features + observation mask [opt.] (4 channels)        — (8,)  if USE_RR_FEATURES
+#      [RR, dRR, peak_amp, dAmp, RR_mask, dRR_mask, amp_mask, dAmp_mask]
+#      Mask channel tells model which values are real beat observations vs forward-filled
+#   4. Sparse beat-even stream (if x_beat_event is provided)                  - (input_len, 7)
+#      [is_beat, is_normal, is_abnormal, RR, dRR, amp, dAmp] at actual beat positions
 #
 # Bidirectional LSTM encoder → BiLSTM projection → multi-head temporal attention
 # pooling [opt.] → HRV feature fusion [opt.] → shared hidden state
@@ -245,6 +248,17 @@ class ProbabilisticLSTM(nn.Module):
             num_beat_classes, embed_dim, padding_idx=0
         )
 
+        # Beat even encoder
+        # x_beat_event is a sparse tensore with non-zero values at actual beat positions
+        # beat_event_proj fuses resulting context vector with LSTM hidden state
+        self.beat_event_encoder = nn.Sequential(
+            nn.Conv1d(in_channels=7, out_channels=32, kernel_size=5, padding=2),
+            nn.ReLU(),
+            nn.Conv1d(in_channels=32, out_channels=hidden_size, kernel_size=5, padding=2),
+            nn.ReLU()
+        )
+        self.beat_event_proj = nn.Linear(hidden_size * 2, hidden_size)
+
         # LSTM input size: signal + embedding + optional feature channels
         feat_channels  = N_FEAT_CHANNELS if use_rr_features else 0
         lstm_input_dim = INPUT_CHANNELS + embed_dim + feat_channels
@@ -304,6 +318,8 @@ class ProbabilisticLSTM(nn.Module):
         x_annot:     torch.Tensor,          # (batch, input_len)         int64
         x_feat:      torch.Tensor | None,   # (batch, input_len, 4)     float32
         x_hrv:       torch.Tensor | None = None,   # (batch, 3)          float32
+        x_feat_mask: torch.Tensor | None = None,   # (batch, input_len, 4) float32 - 1 where observed, 0 where forward-filled
+        x_beat_event:torch.Tensor | None = None,   # (batch, input_len, 7) float32 - sparse beat-event stream
         y_signal:    torch.Tensor | None = None,   # (batch, forecast_len) float32, for teacher forcing
         return_attn: bool = False,
     ) -> tuple:
@@ -319,7 +335,10 @@ class ProbabilisticLSTM(nn.Module):
         emb   = self.beat_embedding(x_annot)           # (batch, input_len, embed_dim)
         parts = [x_signal, emb]
         if self.use_rr_features and x_feat is not None:
-            parts.append(x_feat)
+            if x_feat_mask is not None:
+                parts.append(torch.cat([x_feat, x_feat_mask], dim=-1))
+            else:
+                parts.append(x_feat)
 
         lstm_in     = torch.cat(parts, dim=-1)
         lstm_out, _ = self.lstm(lstm_in)               # (batch, input_len, 2*hidden)
@@ -340,6 +359,13 @@ class ProbabilisticLSTM(nn.Module):
         # HRV feature fusion
         if x_hrv is not None and hasattr(self, 'hrv_proj'):
             h = torch.relu(self.hrv_proj(torch.cat([h, x_hrv], dim=-1)))
+
+        # Beat event encoder and fusing with h 
+        if x_beat_event is not None:
+            be = x_beat_event.permute(0, 2, 1)           # (batch, 7, input_len) for Conv1d
+            be_encoded = self.beat_event_encoder(be)       # (batch, hidden_size, input_len)
+            be_pooled = be_encoded.mean(dim=-1)            # (batch, hidden_size)
+            h = torch.relu(self.beat_event_proj(torch.cat([h, be_pooled], dim=-1)))
 
         if self.deterministic:
             mu  = self.fc_mean(h)                      # (batch, forecast_len)

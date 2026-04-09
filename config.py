@@ -109,9 +109,10 @@ CURRICULUM_EPOCHS = 5
 USE_OVERSAMPLING = True
 
 # --- Beat morphology feature channels ---
-# 4 channels: [RR, dRR, peak_amp, dAmp]
+# 8 channels: [RR, dRR, peak_amp, dAmp, RR_mask, dRR_mask, amp_mask, dAmp_mask]
+# Previously 4 channels: [RR, dRR, peak_amp, dAmp]; added mask channels
 # Previously 2 channels (RR, dRR); peak_amp and dAmp are added here.
-N_FEAT_CHANNELS = 4   # was implicitly 2, now 4 (RR, dRR, peak_amp, dAmp)
+N_FEAT_CHANNELS = 8   # was implicitly 2, then 4 (RR, dRR, peak_amp, dAmp), and now 8 (RR, dRR, peak_amp, dAmp, RR_mask, dRR_mask, amp_mask, dAmp_mask)
 
 # --- Dual-lead input ---
 # Number of ECG signal input channels (leads). 2 = lead 0 + lead 1.
