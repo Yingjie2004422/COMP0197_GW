@@ -3,7 +3,12 @@
     "allow": [
       "Bash(python -c \":*)",
       "Bash(python -c \"import config; import dataset; import model; import train; import test; print\\(''All imports OK''\\)\")",
-      "Bash(python -c \"import ast, sys:*)"
+      "Bash(python -c \"import ast, sys:*)",
+      "Bash(python -c ':*)",
+      "Bash(Get-Content \"C:\\\\Users\\\\leona\\\\AppData\\\\Local\\\\Temp\\\\claude\\\\c--Users-leona-Documents-Uni-UCL-Applied-Deep-Learning-group-cw-code-COMP0197-GW\\\\e77635bc-6c53-4767-bb8f-bad5c3463655\\\\tasks\\\\buvmivtzw.output\" -Wait)",
+      "Bash(Select-String --line-buffered \"epoch|Epoch|loss|Loss|member|Member|Early|error|Error|Traceback|done|Done|saved|Saved\")",
+      "Read(//mnt/c/Users/leona/AppData/Local/Temp/**)",
+      "Bash(dir \"C:\\\\\\\\Users\\\\\\\\leona\\\\\\\\AppData\\\\\\\\Local\\\\\\\\Temp\\\\\\\\claude\")"
     ]
   }
 }

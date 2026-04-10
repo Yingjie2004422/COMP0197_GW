@@ -382,7 +382,12 @@ class ProbabilisticLSTM(nn.Module):
         dec_inp = start_tok
         outputs = []
 
-        use_tf = self.training and y_signal is not None
+        # Use teacher forcing whenever y_signal is provided (training OR validation loss
+        # computation).  Free-running only when y_signal is None (actual inference in
+        # test.py, which never passes y_signal).  The previous `self.training and ...`
+        # caused validation to always run free-running from an untrained decoder,
+        # producing catastrophically high val loss and triggering early stopping at epoch 1.
+        use_tf = y_signal is not None
 
         for t in range(self.forecast_len):
             dec_out, dec_hidden = self.decoder_lstm(dec_inp, dec_hidden)   # (batch, 1, hidden)

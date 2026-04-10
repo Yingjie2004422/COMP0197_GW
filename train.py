@@ -448,7 +448,7 @@ def train() -> None:
     K      = K_MDN if USE_MDN else 1
     mode   = "deterministic (MSE)" if DETERMINISTIC else (
         f"MDN K={K}" if K > 1 else
-        ("CRPS" if USE_CRPS_LOSS else f"Beta-NLL β={BETA_NLL}")
+        ("CRPS" if USE_CRPS_LOSS else f"Beta-NLL b={BETA_NLL}")
     )
 
     print(f"[train] Device      : {device}")

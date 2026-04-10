@@ -32,13 +32,13 @@ STRIDE        = 180         # 50% window overlap; balance diversity vs dataset s
 # --- Training ---
 BATCH_SIZE      = 64
 NUM_EPOCHS      = 60        # upper limit; early stopping usually terminates earlier
-LEARNING_RATE   = 1e-3
+LEARNING_RATE   = 2e-4  # was 1e-3; lowered for BiLSTM+attention+seq2seq+beat-encoder stack
 WEIGHT_DECAY    = 1e-4      # L2 regularisation via AdamW (decoupled weight decay)
 TRAIN_VAL_SPLIT = 0.8       # fraction of records used for training
 SEED            = 42
 
 # --- Early stopping ---
-EARLY_STOPPING_PATIENCE = 8  # halt if val loss does not improve for N consecutive epochs
+EARLY_STOPPING_PATIENCE = 15  # was 8; more tolerance needed for complex architecture warmup
 
 # --- Data augmentation ---
 AUGMENT_TRAIN = True   # apply random noise / scaling / wander to training batches
@@ -79,7 +79,7 @@ MC_SAMPLES = 50
 # USE_MDN=True: K_MDN Gaussian components instead of a single Gaussian.
 # K=1 keeps the original single-Gaussian behaviour for backward compatibility.
 USE_MDN = True
-K_MDN   = 3
+K_MDN   = 1    # was 3; K=1 single Gaussian is far more stable with seq2seq decoder
 
 # --- Deep Ensemble ---
 # Train N_ENSEMBLE independent models with different random seeds.
@@ -128,7 +128,7 @@ N_HRV_FEATURES = 3
 # reduces exposure bias so the model learns to chain its own predictions.
 TEACHER_FORCING_RATIO = 0.5   # default / fallback (overridden by schedule)
 TEACHER_FORCING_START = 0.90
-TEACHER_FORCING_END   = 0.10
+TEACHER_FORCING_END   = 0.50  # was 0.10; keep 50% minimum so val rollout stays stable
 
 # --- Label smoothing for risk head ---
 # Soft targets: y_smooth = y * (1 - eps) + 0.5 * eps
