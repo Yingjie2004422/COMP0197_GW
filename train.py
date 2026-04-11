@@ -115,7 +115,42 @@ def augment(
             x_sig[:, start:start + mask_w, :] = 0.0
             x_feat[:, start:start + mask_w, :] = 0.0
 
+    # Lead polarity flip: physiologically valid — ECG polarity depends on electrode placement
+    if torch.rand(1).item() < 0.5:
+        x_sig  = -x_sig
+        x_feat = x_feat.clone()
+        x_feat[:, :, 2] = -x_feat[:, :, 2]   # flip peak_amp
+        x_feat[:, :, 3] = -x_feat[:, :, 3]   # flip dAmp
+
     return x_sig, x_feat
+
+
+def mixup_batch(
+    x_sig:  torch.Tensor,
+    x_feat: torch.Tensor,
+    y_sig:  torch.Tensor,
+    y_risk: torch.Tensor,
+    alpha:  float = 0.4,
+) -> tuple:
+    """Mixup augmentation (Zhang et al., 2018) for ECG windows.
+
+    Interpolates pairs of training samples:
+        x_mix = lam * x_i + (1 - lam) * x_j
+        y_mix = lam * y_i + (1 - lam) * y_j
+
+    lam ~ Beta(alpha, alpha).  alpha=0.4 gives moderate mixing.
+    Shuffled within the same batch so no extra data loading is needed.
+    """
+    batch_size = x_sig.size(0)
+    lam = float(np.random.beta(alpha, alpha))
+    idx = torch.randperm(batch_size, device=x_sig.device)
+
+    x_sig_mix  = lam * x_sig  + (1 - lam) * x_sig[idx]
+    x_feat_mix = lam * x_feat + (1 - lam) * x_feat[idx]
+    y_sig_mix  = lam * y_sig  + (1 - lam) * y_sig[idx]
+    y_risk_mix = lam * y_risk + (1 - lam) * y_risk[idx]
+
+    return x_sig_mix, x_feat_mix, y_sig_mix, y_risk_mix
 
 
 # ---------------------------------------------------------------------------
@@ -251,11 +286,16 @@ def run_epoch(
             # Augment signal (and consistent features) during training only
             if training and AUGMENT_TRAIN:
                 x_sig, x_feat = augment(x_sig, x_feat)
+                # Mixup: applied after per-sample augmentation (p=0.5 per batch)
+                if torch.rand(1).item() < 0.5:
+                    x_sig, x_feat, y_sig, y_risk = mixup_batch(
+                        x_sig, x_feat, y_sig, y_risk
+                    )
 
             if training:
                 optimizer.zero_grad()
 
-            sig_out, risk_logit = model(x_sig, x_ann, x_feat, x_hrv=x_hrv, x_feat_mask=x_feat_mask, 
+            sig_out, risk_logit = model(x_sig, x_ann, x_feat, x_hrv=x_hrv, x_feat_mask=x_feat_mask,
                                         x_beat_event=x_beat_event, y_signal=y_sig)
 
             loss, sig_val, risk_val = combined_loss(

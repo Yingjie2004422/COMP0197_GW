@@ -27,13 +27,13 @@ RESULTS_DIR = "results"
 SAMPLING_RATE = 360         # MIT-BIH records are sampled at 360 Hz
 INPUT_LEN     = 720         # 2 seconds of past ECG + annotations fed to the model
 FORECAST_LEN  = 180         # 0.5 seconds of future ECG to predict
-STRIDE        = 180         # 50% window overlap; balance diversity vs dataset size
+STRIDE        = 90          # 75% window overlap; doubles training windows vs STRIDE=180
 
 # --- Training ---
 BATCH_SIZE      = 64
 NUM_EPOCHS      = 60        # upper limit; early stopping usually terminates earlier
 LEARNING_RATE   = 2e-4  # was 1e-3; lowered for BiLSTM+attention+seq2seq+beat-encoder stack
-WEIGHT_DECAY    = 1e-4      # L2 regularisation via AdamW (decoupled weight decay)
+WEIGHT_DECAY    = 5e-4      # was 1e-4; increased to combat overfitting
 TRAIN_VAL_SPLIT = 0.8       # fraction of records used for training
 SEED            = 42
 
@@ -44,9 +44,9 @@ EARLY_STOPPING_PATIENCE = 15  # was 8; more tolerance needed for complex archite
 AUGMENT_TRAIN = True   # apply random noise / scaling / wander to training batches
 
 # --- Model architecture ---
-HIDDEN_SIZE    = 128
+HIDDEN_SIZE    = 96         # was 128; reduces parameters ~35% to reduce overfitting
 NUM_LAYERS     = 2
-DROPOUT        = 0.3        # applied between LSTM layers and before output heads
+DROPOUT        = 0.5        # was 0.3; increased to combat overfitting
 USE_LAYER_NORM = True       # LayerNorm on the final LSTM hidden state
 
 # --- Temporal attention ---
@@ -70,7 +70,7 @@ RISK_LAMBDA = 1.0
 # --- Beta-NLL (Seitzer et al., 2022) ---
 # Weights the NLL loss by σ^(2β) to prevent variance collapse.
 # β=0 → standard NLL; β=0.5 → recommended default.
-BETA_NLL = 0.5
+BETA_NLL = 0.7              # was 0.5; stronger variance regularisation
 
 # --- MC Dropout inference (epistemic uncertainty) ---
 MC_SAMPLES = 50
