@@ -852,8 +852,8 @@ def plot_risk_analysis(
     loader,
     device:      torch.device,
     K:           int,
-    opt_thresh:  float = 0.5,
-    max_batches: int = 60,
+    opt_thresh:  float = 0.5 | None = None,
+    max_batches = 60,
 ) -> None:
     """Plot risk score distribution and ROC curve.
 
@@ -890,7 +890,7 @@ def plot_risk_analysis(
 
             prob = torch.stack(batch_risks).mean(dim=0)
             all_probs.append(prob.cpu().numpy())
-            all_labels.append(y_risk.numpy())
+            all_labels.append(y_risk.cpu().numpy())
 
     probs  = np.concatenate(all_probs)
     labels = np.concatenate(all_labels)
@@ -952,7 +952,7 @@ def plot_calibration(
     device:      torch.device,
     K:           int,
     q_conformal: float | None = None,
-    max_batches: int = 60,
+    max_batches = 60,
 ) -> float:
     """Plot expected vs actual Gaussian coverage and compute ECE.
 
@@ -993,7 +993,11 @@ def plot_calibration(
             sigma = torch.sqrt(torch.stack(batch_vars).mean(dim=0)).clamp(min=1e-6)
             all_mu.append(mu.cpu().numpy())
             all_sigma.append(sigma.cpu().numpy())
-            all_y.append(y_sig.numpy())
+            all_y.append(y_sig.cpu().numpy())
+
+    if not all_mu:
+        print("[test] No data for calibration plot")
+        return float("nan")
 
     mu_arr    = np.concatenate(all_mu).ravel()
     sigma_arr = np.concatenate(all_sigma).ravel()
@@ -1220,7 +1224,7 @@ def plot_attention_weights(
 # Plot 7 — Uncertainty analysis plot
 # ---------------------------------------------------------------------------
 
-def plot_uncertainty_scatter_decomposed(errors, total, ale, epi, save_dir="results"):
+def plot_uncertainty_scatter_decomposed(errors, total, ale, epi):
 
     plt.figure(figsize=(6,5))
 
@@ -1237,7 +1241,7 @@ def plot_uncertainty_scatter_decomposed(errors, total, ale, epi, save_dir="resul
     plt.legend()
     plt.grid(alpha=0.3)
 
-    out = os.path.join(save_dir, "uncertainty_scatter_decomposed.png")
+    out = os.path.join(RESULTS_DIR, "uncertainty_scatter_decomposed.png")
     plt.savefig(out, dpi=150, bbox_inches="tight")
     plt.close()
 
@@ -1247,7 +1251,7 @@ def plot_uncertainty_scatter_decomposed(errors, total, ale, epi, save_dir="resul
 # Plot 8 — Uncertainty quantile plot
 # ---------------------------------------------------------------------------
 
-def plot_quantile_decomposed(errors, total, ale, epi, save_dir="results", n_bins=10):
+def plot_quantile_decomposed(errors, total, ale, epi, n_bins=10):
 
     def compute_curve(errors, uncs):
         idx = np.argsort(uncs)
@@ -1273,7 +1277,7 @@ def plot_quantile_decomposed(errors, total, ale, epi, save_dir="results", n_bins
     plt.legend()
     plt.grid(alpha=0.3)
 
-    out = os.path.join(save_dir, "quantile_decomposed.png")
+    out = os.path.join(RESULTS_DIR, "quantile_decomposed.png")
     plt.savefig(out, dpi=150, bbox_inches="tight")
     plt.close()
 
@@ -1283,7 +1287,7 @@ def plot_quantile_decomposed(errors, total, ale, epi, save_dir="results", n_bins
 # Plot 9 — Uncertainty by retention plot
 # ---------------------------------------------------------------------------
 
-def plot_retention_decomposed(errors, total, ale, epi, save_dir="results"):
+def plot_retention_decomposed(errors, total, ale, epi):
 
     def compute_curve(errors, uncs):
         idx = np.argsort(uncs)
@@ -1314,7 +1318,7 @@ def plot_retention_decomposed(errors, total, ale, epi, save_dir="results"):
     plt.legend()
     plt.grid(alpha=0.3)
 
-    out = os.path.join(save_dir, "retention_decomposed.png")
+    out = os.path.join(RESULTS_DIR, "retention_decomposed.png")
     plt.savefig(out, dpi=150, bbox_inches="tight")
     plt.close()
 
@@ -1377,8 +1381,8 @@ def main() -> None:
     # 6. All plots
     plot_predictions(models, val_loader, device, K=K, q_conformal=q_conformal)
     plot_uncertainty_horizon(models, val_loader, device, K=K)
-    plot_risk_analysis(models, val_loader, device, K=K, opt_thresh=opt_t)
-    ece = plot_calibration(models, val_loader, device, K=K, q_conformal=q_conformal)
+    plot_risk_analysis(models, val_loader, device, K=K, opt_thresh=opt_t, max_batches=None)
+    ece = plot_calibration(models, val_loader, device, K=K, q_conformal=q_conformal, max_batches=None)
     plot_arrhythmia_uncertainty(models, val_loader, device, K=K)
     plot_attention_weights(models, val_loader, device, K=K)
     plot_uncertainty_scatter_decomposed(errors, total, ale, epi)

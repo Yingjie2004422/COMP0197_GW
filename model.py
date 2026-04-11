@@ -154,6 +154,7 @@ class TemporalAttention(nn.Module):
         scores  = self.score(lstm_out).squeeze(-1)   # (batch, seq_len)
         weights = torch.softmax(scores, dim=-1)       # (batch, seq_len)
         context = (weights.unsqueeze(-1) * lstm_out).sum(dim=1)  # (batch, hidden)
+
         return context, weights
 
 
@@ -260,7 +261,7 @@ class ProbabilisticLSTM(nn.Module):
         self.beat_event_proj = nn.Linear(hidden_size * 2, hidden_size)
 
         # LSTM input size: signal + embedding + optional feature channels
-        feat_channels  = N_FEAT_CHANNELS if use_rr_features else 0
+        feat_channels = (2 * N_FEAT_CHANNELS) if use_rr_features else 0
         lstm_input_dim = INPUT_CHANNELS + embed_dim + feat_channels
 
         # Bidirectional LSTM
@@ -332,6 +333,7 @@ class ProbabilisticLSTM(nn.Module):
         risk_logit : (batch, 1)  or  None
         attn_weights (only when return_attn=True) : (batch, input_len) or None
         """
+
         emb   = self.beat_embedding(x_annot)           # (batch, input_len, embed_dim)
         parts = [x_signal, emb]
         if self.use_rr_features and x_feat is not None:

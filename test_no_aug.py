@@ -1165,7 +1165,7 @@ def plot_attention_weights(
 # Plot 7 — Uncertainty analysis plot
 # ---------------------------------------------------------------------------
 
-def plot_uncertainty_scatter_decomposed(errors, total, ale, epi, save_dir="results"):
+def plot_uncertainty_scatter_decomposed(errors, total, ale, epi):
 
     plt.figure(figsize=(6,5))
 
@@ -1182,7 +1182,7 @@ def plot_uncertainty_scatter_decomposed(errors, total, ale, epi, save_dir="resul
     plt.legend()
     plt.grid(alpha=0.3)
 
-    out = os.path.join(save_dir, "uncertainty_scatter_decomposed.png")
+    out = os.path.join(RESULTS_DIR, "uncertainty_scatter_decomposed.png")
     plt.savefig(out, dpi=150, bbox_inches="tight")
     plt.close()
 
@@ -1192,7 +1192,7 @@ def plot_uncertainty_scatter_decomposed(errors, total, ale, epi, save_dir="resul
 # Plot 8 — Uncertainty quantile plot
 # ---------------------------------------------------------------------------
 
-def plot_quantile_decomposed(errors, total, ale, epi, save_dir="results", n_bins=10):
+def plot_quantile_decomposed(errors, total, ale, epi, n_bins=10):
 
     def compute_curve(errors, uncs):
         idx = np.argsort(uncs)
@@ -1218,7 +1218,7 @@ def plot_quantile_decomposed(errors, total, ale, epi, save_dir="results", n_bins
     plt.legend()
     plt.grid(alpha=0.3)
 
-    out = os.path.join(save_dir, "quantile_decomposed.png")
+    out = os.path.join(RESULTS_DIR, "quantile_decomposed.png")
     plt.savefig(out, dpi=150, bbox_inches="tight")
     plt.close()
 
@@ -1228,7 +1228,7 @@ def plot_quantile_decomposed(errors, total, ale, epi, save_dir="results", n_bins
 # Plot 9 — Retention curve for uncertainty evaluation
 # ---------------------------------------------------------------------------
 
-def plot_retention_decomposed(errors, total, ale, epi, save_dir="results"):
+def plot_retention_decomposed(errors, total, ale, epi):
 
     def compute_curve(errors, uncs):
         idx = np.argsort(uncs)
@@ -1259,7 +1259,7 @@ def plot_retention_decomposed(errors, total, ale, epi, save_dir="results"):
     plt.legend()
     plt.grid(alpha=0.3)
 
-    out = os.path.join(save_dir, "retention_decomposed.png")
+    out = os.path.join(RESULTS_DIR, "retention_decomposed.png")
     plt.savefig(out, dpi=150, bbox_inches="tight")
     plt.close()
 

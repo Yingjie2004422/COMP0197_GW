@@ -216,7 +216,18 @@ def fit_temperature(model, val_loader, device) -> float:
             x_feat = batch["x_feat"].to(device)
             x_hrv  = batch["x_hrv"].to(device)
             y_risk = batch["y_risk"].to(device)
-            _, risk_logit = model(x_sig, x_ann, x_feat, x_hrv=x_hrv)
+            x_feat_mask  = batch["x_feat_mask"].to(device)
+            x_beat_event = batch["x_beat_event"].to(device)
+
+            _, risk_logit = model(
+                x_sig,
+                x_ann,
+                x_feat,
+                x_hrv=x_hrv,
+                x_feat_mask=x_feat_mask,
+                x_beat_event=x_beat_event,
+            )
+            
             if risk_logit is None:
                 return 1.0
             all_logits.append(risk_logit.squeeze(-1).cpu())
@@ -515,8 +526,15 @@ def train() -> None:
 
     # Build a normal-only loader for curriculum learning.
     # train_loader.dataset is the ECGDataset; Subset restricts to normal_indices.
-    train_ds      = train_loader.dataset
-    normal_subset = Subset(train_ds, train_ds.normal_indices)
+    train_ds = train_loader.dataset
+
+    normal_indices = [
+        i for i, s in enumerate(train_ds.window_subtypes)
+        if s == WINDOW_SUBTYPES["normal"]
+    ]
+
+    normal_subset = Subset(train_ds, normal_indices)
+
     normal_loader = DataLoader(
         normal_subset, batch_size=BATCH_SIZE, shuffle=True,
         num_workers=0, pin_memory=False,
